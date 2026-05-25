@@ -1,127 +1,250 @@
-Preciso otimizar um sistema Python de busca massiva de arquivos para trabalhar com mais de 5 MILHÕES de arquivos em HDD mecânico.
+Buscador de Gravações — HDD Edition
 
-IMPORTANTE — ENTENDA A ESTRUTURA REAL DO SISTEMA:
+Sistema profissional de busca massiva de arquivos otimizado para HDD mecânico, projetado para trabalhar com milhões de arquivos sem travar a interface.
+Baseado em arquitetura HDD-first, priorizando throughput sequencial, baixo overhead e estabilidade.
 
-ESTRUTURA:
+🚀 Features
+Busca em 5M+ arquivos
+Compatível com:
+.mp3
+.wav
+.ogg
+Busca por números contidos no nome do arquivo
+Interface gráfica com Tkinter
+Leitura de números via Excel/CSV
+Sistema otimizado para HDD mecânico
+Scanner extremamente leve usando os.scandir()
+Match otimizado com:
+pyahocorasick (recomendado)
+fallback para regex compilada
+Thread única de I/O para evitar gargalo de seeks
+Interface passiva (sem travamentos)
+Sistema de parada segura
+Logs de erro
+Cópia automática dos arquivos encontrados
+🧠 Filosofia do Projeto
 
-* O programa .py fica em uma pasta principal
-* O arquivo Excel fica na MESMA pasta do programa
-* A pasta de “achados” também fica nessa mesma pasta local
-* Porém o DIRETÓRIO onde os arquivos são procurados é OUTRO caminho separado (rede/local externo)
+Este projeto NÃO tenta usar:
 
-Fluxo atual:
+multithreading agressivo
+milhares de callbacks Tkinter
+filas complexas
+polling excessivo
+renderização constante da UI
 
-1. Usuário abre o programa
-2. Programa lê uma planilha Excel local
-3. Programa carrega milhares de números de telefone
-4. Programa percorre um diretório externo gigantesco
-5. Programa procura arquivos cujo NOME contenha os números da planilha
-6. Quando encontra:
+Porque em HDD mecânico isso normalmente:
 
-   * copia o arquivo para a pasta “Encontrados”
-   * que fica localmente junto do programa
+piora performance
+aumenta seeks
+reduz throughput
+cria gargalo de CPU/GIL
 
-Cenário real:
+O foco aqui é:
 
-* Mais de 5 milhões de arquivos
-* HDD mecânico
-* Intel i7 5ª geração
-* 16 GB RAM
-* Throughput do HDD ~112 MB/s
-* Arquivos entre 2 KB e 2000 KB
-* Média de 500 KB
-* Estrutura extremamente profunda de diretórios
+Máximo throughput sequencial do disco
+⚡ Performance Esperada
 
-Problema atual:
-A nova arquitetura ficou MAIS lenta que a versão simples.
-Velocidade atual:
+Hardware alvo:
 
-* aproximadamente 500 arquivos/s
+Intel i7 5ª geração
+16 GB RAM
+HDD mecânico (~112 MB/s)
 
-Suspeita:
-O excesso de:
+Velocidade esperada:
 
-* regex gigante
-* queues
-* threading excessivo
-* polling
-* batches complexos
-* UI updates
-* StringVar/Listbox
-* sincronização entre threads
+Cenário	Velocidade
+HDD comum	3k ~ 8k arquivos/s
+SSD SATA	10k ~ 30k arquivos/s
+NVMe	Muito acima disso
+📂 Estrutura do Sistema
+Projeto/
+│
+├── buscador.py
+├── numeros.xlsx
+├── Encontrados/
+│
+└── (diretório externo gigantesco onde os arquivos serão procurados)
 
-acabou gerando mais overhead do que ganho real.
+Fluxo:
 
-Quero uma NOVA arquitetura PROFISSIONAL focada em:
+Programa inicia
+Lê planilha Excel/CSV
+Carrega números
+Percorre diretório externo
+Procura arquivos contendo os números
+Copia arquivos encontrados para Encontrados
+🔍 Como Funciona
+Scanner
 
-* HDD mecânico
-* throughput sequencial
-* baixo overhead
-* simplicidade eficiente
-* máxima velocidade real
-* estabilidade
-* confiabilidade total
+Utiliza:
 
-REQUISITOS:
+os.scandir()
 
-* NÃO pode pular arquivos
-* Busca deve ser 100% confiável
-* Os números devem existir no NOME do arquivo
-* Compatível com:
+em vez de:
 
-  * .mp3
-  * .wav
-  * .ogg
-* Interface Tkinter deve continuar responsiva
-* Botão PARAR deve funcionar
-* Deve copiar apenas arquivos encontrados
+os.walk()
 
-Quero remover tudo que esteja deixando o sistema lento desnecessariamente.
+Porque:
 
-Analise especialmente:
+reduz alocações
+reduz overhead Python
+melhora desempenho em milhões de arquivos
+Match de Nomes
+Melhor opção (recomendada)
 
-1. Regex gigante compilada
-2. Uso de queue.Queue
-3. Thread separada para cópia
-4. Polling constante da UI
-5. Atualização de Listbox
-6. Uso de StringVar
-7. root.after excessivo
-8. Overhead de threading
-9. Gargalo de seeks no HDD
-10. Contenção causada por leitura + escrita simultânea
-11. Custo de regex.search em milhões de arquivos
-12. Gargalo de lock/context switching
-13. Gargalo do Tkinter
+Instale:
 
-Quero uma solução REALMENTE otimizada para HDD mecânico.
+pip install pyahocorasick
 
-OBJETIVO:
-Transformar o sistema em algo mais próximo de:
+O sistema utilizará:
 
-* Everything Search
-* indexadores profissionais
-* scanners massivos de arquivos
+algoritmo Aho-Corasick em C
+complexidade O(len(nome))
+muito mais rápido que regex gigante
+Fallback automático
 
-Quero sugestões profissionais sobre:
+Se pyahocorasick não estiver instalado:
 
-* Melhor algoritmo de busca
-* Melhor forma de percorrer diretórios
-* Melhor estrutura para 5M+ arquivos
-* Melhor forma de evitar seeks no HDD
-* Melhor estratégia de cópia
-* Melhor estratégia de batches
-* Melhor frequência de atualização da UI
-* Melhor estrutura de logs
-* Melhor estratégia para manter o HDD trabalhando sequencialmente
+o sistema usa regex compilada
+ainda funciona normalmente
+porém mais lento
+🖥 Interface
 
-Quero também:
+A UI foi desenhada para ser:
 
-* comparação da arquitetura antiga vs nova
-* explicação detalhada do motivo da nova versão ter ficado mais lenta
-* análise de CPU-bound vs I/O-bound
-* sugestões de otimização REALISTAS para HDD
-* código mais rápido possível para esse hardware específico
-* estratégias usadas por softwares profissionais de busca massiva
+leve
+passiva
+não bloquear o scanner
 
+Atualizações:
 
+apenas 1x por segundo
+sem redraw massivo
+sem Listbox sendo atualizada continuamente
+📦 Instalação
+1. Clone o projeto
+git clone https://github.com/seuusuario/buscador-gravacoes.git
+cd buscador-gravacoes
+2. Instale as dependências
+pip install pandas openpyxl
+
+Opcional (RECOMENDADO):
+
+pip install pyahocorasick
+▶ Como Executar
+python buscador.py
+📑 Formato da Planilha
+
+A planilha deve conter os números na:
+
+Coluna A
+
+Exemplo:
+
+A
+11999998888
+21988887777
+31977776666
+
+O sistema:
+
+remove caracteres especiais
+remove .0
+limpa espaços automaticamente
+⚙ Configurações
+
+No topo do código:
+
+EXTENSOES = frozenset({".mp3", ".wav", ".ogg"})
+Atualização da UI
+UI_INTERVALO_S = 1.0
+Máximo de linhas exibidas
+MAX_LINHAS_UI = 5000
+🧩 Estratégia HDD-First
+Por que NÃO usar múltiplas threads de I/O?
+
+Em HDD:
+
+leitura e escrita simultânea causam seeks constantes
+o cabeçote do disco alterna entre posições
+throughput despenca
+
+Por isso:
+
+o scanner roda sozinho
+a cópia ocorre em sequência
+o HDD trabalha de forma mais linear possível
+📈 Complexidade
+Operação	Complexidade
+Varredura	O(N)
+Match Aho-Corasick	O(len(nome))
+Lookup	O(1)
+UI	O(1) por segundo
+🛠 Tecnologias
+Python 3.11+
+Tkinter
+pandas
+openpyxl
+pyahocorasick
+os.scandir()
+📋 Logs
+
+Erros são gravados em:
+
+buscador.log
+
+O sistema evita logs excessivos para não degradar performance.
+
+📌 Recomendações
+HDD mecânico
+
+✅ Recomendado:
+
+Thread única de I/O
+Destino no mesmo disco
+Sem antivírus analisando os arquivos
+Windows Defender excluindo a pasta
+
+❌ Evite:
+
+Muitas threads
+Atualização constante da UI
+Logs excessivos
+Regex gigantescas
+Queue excessiva
+🔥 Melhor Performance Possível
+
+Para máxima velocidade:
+
+Instale:
+pip install pyahocorasick
+
+Isso é o que mais impacta performance no projeto.
+
+📄 Licença
+╔══════════════════════════════════════════════════════════════════════════════╗
+║   BUSCADOR DE GRAVAÇÕES — ARQUITETURA HDD-FIRST                            ║
+║   Princípio: um thread de I/O, match mínimo, UI passiva                    ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+FILOSOFIA DE DESIGN:
+  O gargalo é 100% I/O (HDD mecânico ~100 IOPS aleatório).
+  Qualquer overhead de CPU/threading que force seeks adicionais
+  é mais caro que o trabalho que substitui.
+
+  Regra de ouro para HDD:
+    • UM thread acessa o disco por vez
+    • Scanner e copier nunca rodam ao mesmo tempo no mesmo disco
+    • Match deve ser O(1) ou O(len(nome)) em C puro, sem Python-loop
+    • UI nunca chama nada pesado no caminho crítico
+
+ARQUITETURA:
+  Thread Principal (Tkinter)
+      └─▶ Worker Thread ÚNICO
+              ├─ os.scandir recursivo (stack explícita, BFS)
+              ├─ match via pyahocorasick (Aho-Corasick em C)
+              │    └─▶ fallback: frozenset + str.__contains__ se sem lib
+              ├─ achados acumulados em lista simples (sem Queue)
+              └─ cópia serial APÓS varredura (evita seek concorrente)
+
+  UI: root.after(1000) — um timer por segundo, sem polling agressivo

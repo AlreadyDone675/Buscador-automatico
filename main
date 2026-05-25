@@ -1,0 +1,639 @@
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import threading
+import time
+import logging
+import sys
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Callable
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+import pandas as pd
+
+
+# DETECÇÃO DE pyahocorasick (opcional mas recomendado)
+
+try:
+    import ahocorasick
+    _AHO_DISPONIVEL = True
+except ImportError:
+    _AHO_DISPONIVEL = False
+
+
+# CONFIGURAÇÃO INICIAL
+
+
+PASTA_PRINCIPAL = r"Pasta onde você vai procurar os arquivos"
+PASTA_DESTINO = r"Pasta aonde voce vai salvar o arquivo encontrado"
+
+"""
+
+PERFORMANCE ESPERADA:
+  Hardware: i7 5ª gen, 16 GB RAM, HDD 112 MB/s
+  Velocidade real esperada: 3.000–8.000 arq/s
+  (teto físico do HDD, não do código)
+"""
+
+
+
+# CONFIGURAÇÃO
+EXTENSOES        = frozenset({".mp3", ".wav", ".ogg"})
+
+# UI: atualiza a cada N segundos (não por arquivo — evita GIL contention)
+UI_INTERVALO_S   = 1.0
+
+# Log simples — apenas erros críticos no caminho crítico
+LOG_FILE         = "buscador.log"
+
+# Máximo de linhas na Listbox (evita uso excessivo de RAM)
+MAX_LINHAS_UI    = 5_000
+
+
+# LOGGING — apenas para erros; info vira só no resumo final
+
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.WARNING,          # só WARNING+ no caminho crítico
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+
+
+# ESTRUTURA DE RESULTADO
+
+
+@dataclass(slots=True)          # slots=True: ~30% menos memória que dict
+class Achado:
+    nome:    str
+    origem:  str
+    destino: str
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTRUÇÃO DO MATCHER
+#
+# Dois caminhos:
+#   A) pyahocorasick instalado → automato Aho-Corasick em C puro
+#      Complexidade: O(len(nome)) independente do número de padrões
+#      Muito mais rápido que re.search com 10k+ alternativas
+#
+#   B) fallback Python → frozenset de números + any(n in nome for n in nums)
+#      Complexidade: O(P × len(nome)) — ruim com muitos padrões
+#      Use apenas como fallback; instale pyahocorasick para produção
+# ─────────────────────────────────────────────────────────────────────────────
+
+def construir_matcher(numeros: frozenset[str]) -> Callable[[str], bool]:
+    """
+    Retorna uma função match(nome: str) -> bool otimizada.
+
+    Com pyahocorasick:
+      - Constrói o autômato uma vez (O(soma_len_padrões))
+      - Cada busca é O(len(nome)) em C — sem GIL durante a busca
+
+    Sem pyahocorasick (fallback):
+      - Usa re.compile com alternações ordenadas
+      - CPython re usa DFA para literais — aceitável para <5k padrões
+      - Para >10k padrões considere MUITO instalar a lib
+    """
+    if _AHO_DISPONIVEL:
+        A = ahocorasick.Automaton()
+        for idx, numero in enumerate(numeros):
+            A.add_word(numero, (idx, numero))
+        A.make_automaton()
+
+        def _match_aho(nome: str) -> bool:
+            # iter() retorna (end_idx, value) para cada match
+            # Qualquer match → retorna True imediatamente
+            for _ in A.iter(nome):
+                return True
+            return False
+
+        return _match_aho
+
+    else:
+        # Fallback: regex compilada com alternativas do mais longo ao mais curto
+        # Isso força o motor a tentar padrões mais específicos primeiro,
+        # reduzindo backtracking
+        if not numeros:
+            return lambda _: False
+
+        padroes = sorted(numeros, key=len, reverse=True)
+        # re.compile com IGNORECASE desativado (nomes de arquivo são numéricos)
+        # e sem flags extras = motor mais rápido
+        rx = re.compile("|".join(re.escape(p) for p in padroes))
+
+        def _match_re(nome: str) -> bool:
+            return rx.search(nome) is not None
+
+        return _match_re
+
+
+
+# CARGA DA PLANILHA
+def carregar_numeros(caminho: str) -> Optional[frozenset[str]]:
+    """
+    Lê coluna A e retorna frozenset de strings numéricas limpas.
+
+    frozenset:
+      • Imutável → thread-safe sem lock (múltiplas leituras simultâneas OK)
+      • Hashing O(1) por elemento
+    """
+    ext = os.path.splitext(caminho)[1].lower()
+    try:
+        if ext == ".csv":
+            df = pd.read_csv(caminho, usecols=[0], dtype=str, header=None)
+        else:
+            df = pd.read_excel(caminho, usecols=[0], dtype=str, header=None)
+
+        nums: set[str] = set()
+        for val in df.iloc[:, 0].dropna():
+            limpo = re.sub(r"\D", "", str(val).strip().removesuffix(".0"))
+            if limpo:
+                nums.add(limpo)
+
+        return frozenset(nums)
+
+    except Exception as e:
+        log.exception("Erro ao carregar planilha.")
+        messagebox.showerror("Erro na planilha", str(e))
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WORKER PRINCIPAL — scanner + copier em sequência, sem paralelismo de I/O
+#
+# POR QUE NÃO PARALELIZAR SCANNER E COPIER?
+#
+# Em HDD mecânico, a cabeça magnética só pode estar em UMA posição por vez.
+# Se scanner está lendo em /Gravacoes/2023/... (posição X do disco)
+# e copier está escrevendo em /Encontrados/ (posição Y do disco),
+# o firmware do HDD alterna entre X e Y a cada operação.
+#
+# Resultado: seek de 8–12ms POR ARQUIVO em vez de leitura sequencial.
+# Com 5M arquivos, isso é 11–16 horas extras de seeks.
+#
+# Solução: varrer tudo primeiro (I/O sequencial de leitura),
+# depois copiar tudo (I/O sequencial de escrita).
+# O cabeçote percorre o disco em duas passadas lineares.
+#
+# EXCEÇÃO: se destino for disco DIFERENTE (HD externo, rede),
+# ativar COPIA_DURANTE_VARREDURA = True abaixo — aí os I/Os
+# não competem fisicamente.
+# ─────────────────────────────────────────────────────────────────────────────
+
+COPIA_DURANTE_VARREDURA = False  # True se destino for disco diferente
+
+def worker(
+    raiz:      str,
+    destino:   str,
+    matcher:   Callable[[str], bool],
+    parar:     threading.Event,
+    stats:     dict,                    # dict compartilhado (sem lock — GIL protege leituras simples)
+    callback_fim: Callable[[list[Achado], list[str]], None],
+):
+    """
+    Thread única de I/O.
+
+    Fase 1 — VARREDURA
+      os.scandir recursivo via stack explícita (BFS para HDD).
+      BFS (breadth-first): processa todos os arquivos de um nível antes
+      de descer — melhor localidade de acesso no HDD que DFS.
+
+      Não usa os.walk() porque:
+        - os.walk() cria listas completas de dirs e arquivos de cada nível
+        - Isso aloca memória para dirs não-visitados e força seeks extras
+        - scandir() com stack explícita mantém apenas o contexto do dir atual
+
+    Fase 2 — CÓPIA (serial)
+      shutil.copy2 para cada achado, na ordem encontrada.
+      Serial = sem seek concorrente = máximo throughput sequencial de escrita.
+    """
+    achados: list[Achado] = []
+    erros:   list[str]    = []
+
+    # ── Fase 1: Varredura ─────────────────────────────────────────────────────
+    stats["fase"] = "Varrendo"
+    stack: list[str] = [raiz]      # lista como stack — append/pop é O(1)
+
+    while stack and not parar.is_set():
+        dir_atual = stack.pop()    # DFS com stack — equivalente a BFS invertido
+                                   # Para BFS real: stack.pop(0) — mas O(n) em lista
+                                   # Use deque se quiser BFS estrito:
+                                   # from collections import deque; stack = deque([raiz])
+                                   # dir_atual = stack.popleft()
+
+        stats["pasta_atual"] = dir_atual
+
+        try:
+            with os.scandir(dir_atual) as it:
+                subdirs: list[str] = []
+
+                for entry in it:
+                    if parar.is_set():
+                        break
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            subdirs.append(entry.path)
+                            continue
+
+                        # Filtragem por extensão — O(1) com frozenset
+                        nome = entry.name
+                        _, ext = os.path.splitext(nome)
+                        if ext.lower() not in EXTENSOES:
+                            stats["analisados"] += 1
+                            continue
+
+                        stats["analisados"] += 1
+
+                        # Match — Aho-Corasick O(len(nome)) em C
+                        if matcher(nome):
+                            destino_arquivo = os.path.join(destino, nome)
+                            achado = Achado(
+                                nome=nome,
+                                origem=entry.path,
+                                destino=destino_arquivo,
+                            )
+                            achados.append(achado)
+                            stats["encontrados"] += 1
+
+                            # Cópia inline só se destino for disco diferente
+                            if COPIA_DURANTE_VARREDURA:
+                                _copiar(achado, erros)
+
+                    except (PermissionError, OSError):
+                        pass
+
+                # Empilha subdiretórios após processar dir atual
+                # Append em batch é mais eficiente que append individual
+                stack.extend(subdirs)
+
+        except (PermissionError, OSError) as e:
+            log.warning("Sem acesso: %s — %s", dir_atual, e)
+
+    # ── Fase 2: Cópia serial (se não copiou durante varredura) ───────────────
+    if not COPIA_DURANTE_VARREDURA and not parar.is_set():
+        stats["fase"] = "Copiando"
+        total_copiar = len(achados)
+
+        for i, achado in enumerate(achados):
+            if parar.is_set():
+                break
+            _copiar(achado, erros)
+            stats["copiados"] = i + 1
+
+    # Sinaliza conclusão via callback (thread-safe com root.after)
+    callback_fim(achados, erros)
+
+
+def _copiar(achado: Achado, erros: list[str]) -> None:
+    """
+    Cópia com verificação de existência.
+    shutil.copy2 preserva metadados (timestamps).
+    """
+    try:
+        if not os.path.exists(achado.destino):
+            shutil.copy2(achado.origem, achado.destino)
+    except Exception as e:
+        erros.append(f"✘ {achado.nome}: {e}")
+        log.warning("Falha ao copiar %s: %s", achado.nome, e)
+
+
+# INTERFACE TKINTER
+
+class Buscador:
+
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        root.title("Buscador de Gravações — HDD Edition")
+        root.resizable(True, True)
+
+        self._parar   = threading.Event()
+        self._stats   = {
+            "analisados": 0,
+            "encontrados": 0,
+            "copiados": 0,
+            "pasta_atual": "",
+            "fase": "Aguardando",
+        }
+        self._ts_inicio   = 0.0
+        self._after_id: Optional[str] = None
+        self._linhas_ui:  list[str]   = []  # buffer da Listbox
+
+        self._build_ui()
+
+    # ── Construção da UI ──────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        root = self.root
+        pad = ttk.Frame(root, padding=14)
+        pad.pack(fill="both", expand=True)
+        pad.columnconfigure(1, weight=1)
+
+        # ── Campos de entrada ─────────────────────────────────────────────────
+        campos = [
+            ("Planilha (Coluna A):", "ent_planilha", None,            self._escolher_planilha),
+            ("Pasta de Busca:",      "ent_busca",    PASTA_PRINCIPAL,  self._escolher_busca),
+            ("Pasta de Destino:",    "ent_destino",  PASTA_DESTINO,    self._escolher_destino),
+        ]
+        for i, (label, attr, default, cmd) in enumerate(campos):
+            ttk.Label(pad, text=label).grid(row=i, column=0, sticky="w", pady=3)
+            ent = ttk.Entry(pad, width=72)
+            if default:
+                ent.insert(0, default)
+            ent.grid(row=i, column=1, padx=5, pady=3, sticky="ew")
+            ttk.Button(pad, text="…", width=3, command=cmd).grid(row=i, column=2)
+            setattr(self, attr, ent)
+
+        # Aviso sobre pyahocorasick
+        aviso_cor = "green" if _AHO_DISPONIVEL else "red"
+        aviso_txt = (
+            "✔  pyahocorasick instalado — match Aho-Corasick em C (máxima velocidade)"
+            if _AHO_DISPONIVEL else
+            "⚠  pyahocorasick NÃO instalado — usando regex fallback (mais lento)\n"
+            "   Execute: pip install pyahocorasick"
+        )
+        lbl_aviso = ttk.Label(pad, text=aviso_txt, foreground=aviso_cor,
+                              font=("Consolas", 8))
+        lbl_aviso.grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 6))
+
+        # Opção: cópia durante varredura
+        self._var_copia_inline = tk.BooleanVar(value=COPIA_DURANTE_VARREDURA)
+        chk = ttk.Checkbutton(
+            pad,
+            text="Destino em disco diferente? (copiar durante varredura)",
+            variable=self._var_copia_inline,
+        )
+        chk.grid(row=4, column=0, columnspan=3, sticky="w", pady=2)
+
+        # Barra de progresso
+        ttk.Label(pad, text="Progresso:").grid(row=5, column=0, sticky="w", pady=5)
+        self.progressbar = ttk.Progressbar(
+            pad, orient="horizontal", mode="indeterminate", length=500)
+        self.progressbar.grid(row=5, column=1, columnspan=2, sticky="ew", pady=5)
+
+        # Fase + pasta atual
+        self.lbl_fase = ttk.Label(pad, text="Pronto.",
+                                  font=("Segoe UI", 9, "bold"), foreground="gray")
+        self.lbl_fase.grid(row=6, column=0, columnspan=3, sticky="w")
+
+        self.lbl_pasta = ttk.Label(pad, text="",
+                                   font=("Segoe UI", 8), foreground="gray",
+                                   anchor="w", width=90)
+        self.lbl_pasta.grid(row=7, column=0, columnspan=3, sticky="ew")
+
+        # Botões
+        btn_frame = ttk.Frame(pad)
+        btn_frame.grid(row=8, column=0, columnspan=3, pady=8)
+        self.btn_iniciar = ttk.Button(btn_frame, text="▶  INICIAR",
+                                      command=self._iniciar, width=18)
+        self.btn_iniciar.pack(side="left", padx=8)
+        self.btn_parar = ttk.Button(btn_frame, text="⏹  PARAR",
+                                    command=self._parar_busca,
+                                    state="disabled", width=18)
+        self.btn_parar.pack(side="left", padx=8)
+
+        # Contadores
+        self.lbl_contadores = ttk.Label(
+            pad, text="Analisados: 0   Encontrados: 0   Velocidade: —",
+            font=("Segoe UI", 9))
+        self.lbl_contadores.grid(row=9, column=0, columnspan=3,
+                                 sticky="w", pady=2)
+
+        # Listbox
+        lf = ttk.Frame(pad)
+        lf.grid(row=10, column=0, columnspan=3, sticky="nsew", pady=6)
+        lf.rowconfigure(0, weight=1)
+        lf.columnconfigure(0, weight=1)
+        pad.rowconfigure(10, weight=1)
+
+        self.lista = tk.Listbox(
+            lf,
+            width=130, height=12,
+            font=("Consolas", 9),
+            selectmode=tk.EXTENDED,
+            activestyle="none",
+        )
+        sb = ttk.Scrollbar(lf, orient="vertical", command=self.lista.yview)
+        self.lista.configure(yscrollcommand=sb.set)
+        self.lista.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+
+    # ── Seletores de arquivo/pasta ────────────────────────────────────────────
+
+    def _escolher_planilha(self):
+        p = filedialog.askopenfilename(
+            filetypes=[("Planilhas", "*.xlsx *.xls *.csv")])
+        if p:
+            self.ent_planilha.delete(0, tk.END)
+            self.ent_planilha.insert(0, p)
+
+    def _escolher_busca(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.ent_busca.delete(0, tk.END)
+            self.ent_busca.insert(0, d)
+
+    def _escolher_destino(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.ent_destino.delete(0, tk.END)
+            self.ent_destino.insert(0, d)
+
+    # ── Controle da busca ─────────────────────────────────────────────────────
+
+    def _iniciar(self):
+        planilha = self.ent_planilha.get().strip()
+        if not planilha or not os.path.exists(planilha):
+            messagebox.showerror("Erro", "Selecione uma planilha válida.")
+            return
+
+        pasta_busca = self.ent_busca.get().strip()
+        if not os.path.isdir(pasta_busca):
+            messagebox.showerror("Erro", "Pasta de busca inválida.")
+            return
+
+        numeros = carregar_numeros(planilha)
+        if not numeros:
+            return
+        if not numeros:
+            messagebox.showerror("Erro", "Nenhum número encontrado na planilha.")
+            return
+
+        matcher = construir_matcher(numeros)
+
+        destino = self.ent_destino.get().strip()
+        os.makedirs(destino, exist_ok=True)
+
+        # Propaga flag de cópia inline para o worker
+        global COPIA_DURANTE_VARREDURA
+        COPIA_DURANTE_VARREDURA = self._var_copia_inline.get()
+
+        # Reset de estado
+        self._parar.clear()
+        self._stats.update(
+            analisados=0, encontrados=0, copiados=0,
+            pasta_atual="", fase="Varrendo"
+        )
+        self._linhas_ui.clear()
+        self.lista.delete(0, tk.END)
+        self._ts_inicio = time.monotonic()
+
+        self.btn_iniciar.config(state="disabled")
+        self.btn_parar.config(state="normal")
+        self.progressbar.start(15)
+        self.lbl_fase.config(text="Varrendo…", foreground="blue")
+
+        # Thread única de I/O
+        threading.Thread(
+            target=worker,
+            args=(pasta_busca, destino, matcher,
+                  self._parar, self._stats, self._on_fim),
+            daemon=True,
+            name="IOWorker",
+        ).start()
+
+        # Timer de UI — 1 atualização por segundo
+        self._agendar_ui()
+
+    def _parar_busca(self):
+        self._parar.set()
+        self.lbl_fase.config(text="Parando…", foreground="orange")
+        self.btn_parar.config(state="disabled")
+
+    # ── Timer de UI — 1 Hz, não polui o GIL ──────────────────────────────────
+
+    def _agendar_ui(self):
+        self._after_id = self.root.after(
+            int(UI_INTERVALO_S * 1000), self._atualizar_ui)
+
+    def _atualizar_ui(self):
+        """
+        Roda na thread principal, 1x por segundo.
+
+        Lê stats do worker sem lock porque:
+          - stats é um dict Python
+          - Leituras e escritas de objetos Python são atômicas no CPython
+            (GIL garante atomicidade de LOAD/STORE de referências)
+          - Não há risco de leitura de estado corrompido
+          - No pior caso, o valor está um ciclo desatualizado (irrelevante para UI)
+
+        NÃO fazemos insert() na Listbox aqui — apenas contadores.
+        A Listbox recebe dados apenas no callback _on_fim (quando a busca termina).
+        Isso elimina completamente o overhead de redesenho da Listbox durante
+        a varredura, que era um dos maiores gargalos da versão anterior.
+        """
+        s = self._stats
+        elapsed = max(time.monotonic() - self._ts_inicio, 0.01)
+        vel = int(s["analisados"] / elapsed)
+        fase = s["fase"]
+
+        self.lbl_fase.config(
+            text=f"{fase}…  {'Copiados: ' + str(s['copiados']) if fase == 'Copiando' else ''}",
+            foreground="blue",
+        )
+
+        pasta = s["pasta_atual"]
+        if pasta:
+            exibir = ("…" + pasta[-85:]) if len(pasta) > 88 else pasta
+            self.lbl_pasta.config(text=exibir)
+
+        self.lbl_contadores.config(
+            text=(
+                f"Analisados: {s['analisados']:,}   "
+                f"Encontrados: {s['encontrados']:,}   "
+                f"Velocidade: {vel:,} arq/s   "
+                f"Tempo: {elapsed:.0f}s"
+            )
+        )
+
+        self._agendar_ui()
+
+    # ── Callback de finalização (chamado via root.after pelo worker) ──────────
+
+    def _on_fim(self, achados: list[Achado], erros: list[str]):
+        """
+        O worker chama isso diretamente, mas em thread diferente.
+        Usamos root.after(0, ...) para garantir execução na thread principal.
+        """
+        self.root.after(0, lambda: self._finalizar(achados, erros))
+
+    def _finalizar(self, achados: list[Achado], erros: list[str]):
+        # Cancela timer de UI
+        if self._after_id:
+            self.root.after_cancel(self._after_id)
+            self._after_id = None
+
+        self.progressbar.stop()
+        self.btn_iniciar.config(state="normal")
+        self.btn_parar.config(state="disabled")
+
+        s = self._stats
+        elapsed = max(time.monotonic() - self._ts_inicio, 0.01)
+
+        self.lbl_fase.config(text="Concluído.", foreground="green")
+        self.lbl_pasta.config(text="Busca encerrada.")
+        self.lbl_contadores.config(
+            text=(
+                f"Analisados: {s['analisados']:,}   "
+                f"Encontrados: {s['encontrados']:,}   "
+                f"Velocidade média: {int(s['analisados']/elapsed):,} arq/s   "
+                f"Tempo total: {elapsed:.1f}s"
+            )
+        )
+
+        # Popula Listbox de uma vez no final (sem overhead durante varredura)
+        linhas = [f"✔  {a.nome}" for a in achados[-MAX_LINHAS_UI:]]
+        if erros:
+            linhas += erros[-200:]
+
+        # insert() em lote — mais previsível que StringVar para listas grandes
+        self.lista.delete(0, tk.END)
+        if linhas:
+            self.lista.insert(tk.END, *linhas)  # *args = uma chamada só
+            self.lista.yview_moveto(1.0)
+
+        # Log final (uma única escrita de I/O para log)
+        log.warning(
+            "RESUMO — Analisados=%d Encontrados=%d Erros=%d Tempo=%.1fs",
+            s["analisados"], s["encontrados"], len(erros), elapsed
+        )
+
+        msg = (
+            f"Busca concluída!\n\n"
+            f"Analisados  : {s['analisados']:,}\n"
+            f"Encontrados : {s['encontrados']:,}\n"
+            f"Erros cópia : {len(erros)}\n"
+            f"Tempo total : {elapsed:.1f}s\n"
+            f"Velocidade  : {int(s['analisados']/elapsed):,} arq/s"
+        )
+        if erros:
+            msg += f"\n\n⚠ {len(erros)} erro(s) — veja a lista."
+        messagebox.showinfo("Concluído", msg)
+
+        destino = self.ent_destino.get().strip()
+        if s["encontrados"] > 0 and os.path.isdir(destino):
+            import subprocess
+            subprocess.Popen(["explorer", os.path.normpath(destino)])
+
+
+# PONTO DE ENTRADA
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    root.minsize(980, 580)
+    w, h = 1020, 640
+    sx = (root.winfo_screenwidth()  - w) // 2
+    sy = (root.winfo_screenheight() - h) // 2
+    root.geometry(f"{w}x{h}+{sx}+{sy}")
+    app = Buscador(root)
+    root.mainloop()

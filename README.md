@@ -124,7 +124,4 @@ Quero também:
 * código mais rápido possível para esse hardware específico
 * estratégias usadas por softwares profissionais de busca massiva
 
-IMPORTANTE:
-Priorizar velocidade REAL no mundo real.
-Não quero arquitetura excessivamente complexa se ela gerar overhead maior que o ganho.
 

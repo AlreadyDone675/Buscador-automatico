@@ -1,14 +1,23 @@
-from __future__ import annotations
 
-import os
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║   BUSCADOR DE GRAVAÇÕES — ARQUITETURA SQLite-FIRST v4.0                    ║
+║   REFATORAÇÃO: UI em 2 abas, CSV corrigido, busca e cópia funcionando      ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+from __future__ import annotations
 import re
+import os
 import shutil
+import sqlite3
 import threading
 import time
 import logging
-import sys
-from collections import deque
-from dataclasses import dataclass
+import subprocess
+import json
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Callable
 
@@ -18,622 +27,1871 @@ from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 
 
-# DETECÇÃO DE pyahocorasick (opcional mas recomendado)
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTES GLOBAIS
+# ─────────────────────────────────────────────────────────────────────────────
 
-try:
-    import ahocorasick
-    _AHO_DISPONIVEL = True
-except ImportError:
-    _AHO_DISPONIVEL = False
+EXTENSOES: frozenset[str] = frozenset({".mp3", ".wav", ".agg", ".ogg"})
 
+DB_PADRAO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "indice_gravacoes.db")
 
-# CONFIGURAÇÃO INICIAL
+BATCH_SIZE = 1_000
+UI_INTERVALO_MS = 1_000
+MAX_LINHAS_UI = 10_000
 
+PASTA_PRINCIPAL_PADRAO = r"\\192.168.101.51\attodigital"
+PASTA_DESTINO_PADRAO   = r"C:\Users\mateus.sousa\Downloads\buscar-ligações\ligações-encontradas"
 
-PASTA_PRINCIPAL = r"Pasta onde você vai procurar os arquivos"
-PASTA_DESTINO = r"Pasta aonde voce vai salvar o arquivo encontrado"
+META_ULTIMA_INDEXACAO = "ultima_indexacao"
+META_STATUS_ULTIMA    = "status_ultima_indexacao"
+META_ULTIMA_PASTA     = "ultima_pasta_processada"
+META_DIRS_CONCLUIDOS  = "dirs_nivel1_concluidos"
 
-"""
-
-PERFORMANCE ESPERADA:
-  Hardware: i7 5ª gen, 16 GB RAM, HDD 112 MB/s
-  Velocidade real esperada: 3.000–8.000 arq/s
-  (teto físico do HDD, não do código)
-"""
-
-
-
-# CONFIGURAÇÃO
-EXTENSOES        = frozenset({".mp3", ".wav", ".ogg"})
-
-# UI: atualiza a cada N segundos (não por arquivo — evita GIL contention)
-UI_INTERVALO_S   = 1.0
-
-# Log simples — apenas erros críticos no caminho crítico
-LOG_FILE         = "buscador.log"
-
-# Máximo de linhas na Listbox (evita uso excessivo de RAM)
-MAX_LINHAS_UI    = 5_000
+MTIME_TOLERANCIA = 2.0
+AVALIACAO_CACHE_SUFIXO = "_avaliacao.json"
+VELOCIDADE_ESTIMADA_ARQ_S = 800
 
 
-# LOGGING — apenas para erros; info vira só no resumo final
-
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.WARNING,          # só WARNING+ no caminho crítico
+    filename="buscador_sqlite.log",
+    level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DATACLASSES
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ESTRUTURA DE RESULTADO
+@dataclass(slots=True)
+class ArquivoInfo:
+    telefone:      str
+    nome:          str
+    caminho:       str
+    extensao:      str
+    modificado_em: float
 
 
-@dataclass(slots=True)          # slots=True: ~30% menos memória que dict
-class Achado:
-    nome:    str
-    origem:  str
-    destino: str
+@dataclass(slots=True)
+class ResultadoBusca:
+    telefone: str
+    nome:     str
+    caminho:  str
+    copiado:  bool = False
+    erro:     str  = ""
+
+
+@dataclass
+class EstatisticasIndexacao:
+    total_arquivos:   int = 0
+    novos:            int = 0
+    atualizados:      int = 0
+    ignorados_mtime:  int = 0
+    dirs_pulados:     int = 0
+    dirs_varridos:    int = 0
+    pasta_atual:      str = ""
+    fase:             str = "Aguardando"
+    ultima_indexacao: str = ""
+
+
+@dataclass
+class EstatisticasBusca:
+    total_numeros: int = 0
+    encontrados:   int = 0
+    copiados:      int = 0
+    erros:         int = 0
+    fase:          str = "Aguardando"
+
+
+@dataclass
+class EstatisticasLimpeza:
+    total_verificados: int = 0
+    removidos:         int = 0
+    fase:              str = "Aguardando"
+
+
+@dataclass
+class ResultadoAvaliacao:
+    total_arquivos:    int   = 0
+    total_dirs:        int   = 0
+    tamanho_bytes:     int   = 0
+    tempo_scan_s:      float = 0.0
+    por_nivel1:        dict  = field(default_factory=dict)
+    cache_path:        str   = ""
+    fase:              str   = "Aguardando"
+    pasta_atual:       str   = ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONSTRUÇÃO DO MATCHER
-#
-# Dois caminhos:
-#   A) pyahocorasick instalado → automato Aho-Corasick em C puro
-#      Complexidade: O(len(nome)) independente do número de padrões
-#      Muito mais rápido que re.search com 10k+ alternativas
-#
-#   B) fallback Python → frozenset de números + any(n in nome for n in nums)
-#      Complexidade: O(P × len(nome)) — ruim com muitos padrões
-#      Use apenas como fallback; instale pyahocorasick para produção
+# MÓDULO 1 — DATABASE MANAGER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def construir_matcher(numeros: frozenset[str]) -> Callable[[str], bool]:
-    """
-    Retorna uma função match(nome: str) -> bool otimizada.
+class DatabaseManager:
 
-    Com pyahocorasick:
-      - Constrói o autômato uma vez (O(soma_len_padrões))
-      - Cada busca é O(len(nome)) em C — sem GIL durante a busca
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._local  = threading.local()
+        self._batches_desde_checkpoint = 0
+        self._inicializar_banco()
 
-    Sem pyahocorasick (fallback):
-      - Usa re.compile com alternações ordenadas
-      - CPython re usa DFA para literais — aceitável para <5k padrões
-      - Para >10k padrões considere MUITO instalar a lib
-    """
-    if _AHO_DISPONIVEL:
-        A = ahocorasick.Automaton()
-        for idx, numero in enumerate(numeros):
-            A.add_word(numero, (idx, numero))
-        A.make_automaton()
+    def _conn(self) -> sqlite3.Connection:
+        if not hasattr(self._local, "conn") or self._local.conn is None:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA temp_store=MEMORY;")
+            conn.execute("PRAGMA cache_size=-100000;")
+            conn.execute("PRAGMA mmap_size=536870912;")
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
+        return self._local.conn
 
-        def _match_aho(nome: str) -> bool:
-            # iter() retorna (end_idx, value) para cada match
-            # Qualquer match → retorna True imediatamente
-            for _ in A.iter(nome):
-                return True
+    def _inicializar_banco(self):
+        conn = self._conn()
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS arquivos (
+                telefone      TEXT NOT NULL,
+                nome          TEXT NOT NULL,
+                caminho       TEXT PRIMARY KEY,
+                extensao      TEXT NOT NULL,
+                modificado_em REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_telefone ON arquivos(telefone);
+            CREATE INDEX IF NOT EXISTS idx_caminho  ON arquivos(caminho);
+            CREATE TABLE IF NOT EXISTS metadata (
+                chave TEXT PRIMARY KEY,
+                valor TEXT
+            );
+        """)
+        conn.commit()
+
+    def salvar_metadata(self, chave: str, valor: str) -> None:
+        conn = self._conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (chave, valor) VALUES (?, ?)",
+            (chave, valor),
+        )
+        conn.commit()
+
+    def ler_metadata(self, chave: str) -> Optional[str]:
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT valor FROM metadata WHERE chave = ?", (chave,)
+        ).fetchone()
+        return row["valor"] if row else None
+
+    def obter_timestamp_ultima_indexacao(self) -> Optional[float]:
+        valor = self.ler_metadata(META_ULTIMA_INDEXACAO)
+        if not valor:
+            return None
+        try:
+            dt = datetime.fromisoformat(valor)
+            return dt.timestamp()
+        except (ValueError, TypeError):
+            return None
+
+    def salvar_checkpoint_indexacao(self, status: str, pasta_atual: str = "") -> None:
+        agora_utc = datetime.now(timezone.utc).isoformat()
+        conn = self._conn()
+        conn.executemany(
+            "INSERT OR REPLACE INTO metadata (chave, valor) VALUES (?, ?)",
+            [
+                (META_ULTIMA_INDEXACAO, agora_utc),
+                (META_STATUS_ULTIMA,    status),
+                (META_ULTIMA_PASTA,     pasta_atual),
+            ],
+        )
+        conn.commit()
+        try:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+            conn.commit()
+        except Exception as e:
+            log.warning("wal_checkpoint após salvar_checkpoint falhou: %s", e)
+
+    def banco_existe_com_dados(self) -> bool:
+        if not os.path.exists(self.db_path):
+            return False
+        try:
+            row = self._conn().execute("SELECT COUNT(*) FROM arquivos").fetchone()
+            return row[0] > 0
+        except Exception:
             return False
 
-        return _match_aho
+    def arquivo_existe_no_banco(self, caminho: str) -> Optional[float]:
+        row = self._conn().execute(
+            "SELECT modificado_em FROM arquivos WHERE caminho = ?", (caminho,)
+        ).fetchone()
+        return row["modificado_em"] if row else None
 
-    else:
-        # Fallback: regex compilada com alternativas do mais longo ao mais curto
-        # Isso força o motor a tentar padrões mais específicos primeiro,
-        # reduzindo backtracking
-        if not numeros:
-            return lambda _: False
+    def inserir_batch(self, arquivos: list[ArquivoInfo]) -> None:
+        if not arquivos:
+            return
+        conn = self._conn()
+        dados = [(a.telefone, a.nome, a.caminho, a.extensao, a.modificado_em) for a in arquivos]
+        conn.executemany(
+            "INSERT OR REPLACE INTO arquivos (telefone, nome, caminho, extensao, modificado_em) VALUES (?,?,?,?,?)",
+            dados,
+        )
+        conn.commit()
+        self._batches_desde_checkpoint += 1
+        if self._batches_desde_checkpoint >= 10:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                self._batches_desde_checkpoint = 0
+            except Exception as e:
+                log.warning("WAL checkpoint falhou: %s", e)
 
-        padroes = sorted(numeros, key=len, reverse=True)
-        # re.compile com IGNORECASE desativado (nomes de arquivo são numéricos)
-        # e sem flags extras = motor mais rápido
-        rx = re.compile("|".join(re.escape(p) for p in padroes))
+    def buscar_por_telefone(self, telefone: str) -> list[sqlite3.Row]:
+        return self._conn().execute(
+            "SELECT nome, caminho FROM arquivos WHERE telefone = ?", (telefone,)
+        ).fetchall()
 
-        def _match_re(nome: str) -> bool:
-            return rx.search(nome) is not None
+    def buscar_batch(self, telefones: list[str]) -> list[sqlite3.Row]:
+        """Busca por substring: o campo telefone contém blocos numéricos separados por '|'.
+        Um arquivo bate se qualquer bloco contém o número buscado, ou o número contém o bloco."""
+        resultados: list[sqlite3.Row] = []
+        conn = self._conn()
+        vistos: set[str] = set()
+        for numero in telefones:
+            numero_limpo = re.sub(r'\D', '', numero)
+            if not numero_limpo:
+                continue
+            # Busca arquivos cujo campo telefone contenha o número como substring
+            rows = conn.execute(
+                "SELECT telefone, nome, caminho FROM arquivos WHERE instr(telefone, ?) > 0",
+                (numero_limpo,),
+            ).fetchall()
+            for row in rows:
+                if row["caminho"] not in vistos:
+                    vistos.add(row["caminho"])
+                    resultados.append(row)
+        return resultados
 
-        return _match_re
+    def remover_inexistentes(self, stats: EstatisticasLimpeza, parar: threading.Event) -> None:
+        conn = self._conn()
+        stats.fase = "Lendo caminhos do banco..."
+        cursor = conn.execute("SELECT caminho FROM arquivos ORDER BY caminho")
+        batch_remover: list[str] = []
 
+        while not parar.is_set():
+            chunk = cursor.fetchmany(5000)
+            if not chunk:
+                break
+            for row in chunk:
+                if parar.is_set():
+                    break
+                caminho = row[0]
+                stats.total_verificados += 1
+                if not os.path.exists(caminho):
+                    batch_remover.append(caminho)
+                    stats.removidos += 1
+                if len(batch_remover) >= 1000:
+                    conn.executemany("DELETE FROM arquivos WHERE caminho = ?", [(c,) for c in batch_remover])
+                    conn.commit()
+                    batch_remover.clear()
 
-
-# CARGA DA PLANILHA
-def carregar_numeros(caminho: str) -> Optional[frozenset[str]]:
-    """
-    Lê coluna A e retorna frozenset de strings numéricas limpas.
-
-    frozenset:
-      • Imutável → thread-safe sem lock (múltiplas leituras simultâneas OK)
-      • Hashing O(1) por elemento
-    """
-    ext = os.path.splitext(caminho)[1].lower()
-    try:
-        if ext == ".csv":
-            df = pd.read_csv(caminho, usecols=[0], dtype=str, header=None)
-        else:
-            df = pd.read_excel(caminho, usecols=[0], dtype=str, header=None)
-
-        nums: set[str] = set()
-        for val in df.iloc[:, 0].dropna():
-            limpo = re.sub(r"\D", "", str(val).strip().removesuffix(".0"))
-            if limpo:
-                nums.add(limpo)
-
-        return frozenset(nums)
-
-    except Exception as e:
-        log.exception("Erro ao carregar planilha.")
-        messagebox.showerror("Erro na planilha", str(e))
-        return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# WORKER PRINCIPAL — scanner + copier em sequência, sem paralelismo de I/O
-#
-# POR QUE NÃO PARALELIZAR SCANNER E COPIER?
-#
-# Em HDD mecânico, a cabeça magnética só pode estar em UMA posição por vez.
-# Se scanner está lendo em /Gravacoes/2023/... (posição X do disco)
-# e copier está escrevendo em /Encontrados/ (posição Y do disco),
-# o firmware do HDD alterna entre X e Y a cada operação.
-#
-# Resultado: seek de 8–12ms POR ARQUIVO em vez de leitura sequencial.
-# Com 5M arquivos, isso é 11–16 horas extras de seeks.
-#
-# Solução: varrer tudo primeiro (I/O sequencial de leitura),
-# depois copiar tudo (I/O sequencial de escrita).
-# O cabeçote percorre o disco em duas passadas lineares.
-#
-# EXCEÇÃO: se destino for disco DIFERENTE (HD externo, rede),
-# ativar COPIA_DURANTE_VARREDURA = True abaixo — aí os I/Os
-# não competem fisicamente.
-# ─────────────────────────────────────────────────────────────────────────────
-
-COPIA_DURANTE_VARREDURA = False  # True se destino for disco diferente
-
-def worker(
-    raiz:      str,
-    destino:   str,
-    matcher:   Callable[[str], bool],
-    parar:     threading.Event,
-    stats:     dict,                    # dict compartilhado (sem lock — GIL protege leituras simples)
-    callback_fim: Callable[[list[Achado], list[str]], None],
-):
-    """
-    Thread única de I/O.
-
-    Fase 1 — VARREDURA
-      os.scandir recursivo via stack explícita (BFS para HDD).
-      BFS (breadth-first): processa todos os arquivos de um nível antes
-      de descer — melhor localidade de acesso no HDD que DFS.
-
-      Não usa os.walk() porque:
-        - os.walk() cria listas completas de dirs e arquivos de cada nível
-        - Isso aloca memória para dirs não-visitados e força seeks extras
-        - scandir() com stack explícita mantém apenas o contexto do dir atual
-
-    Fase 2 — CÓPIA (serial)
-      shutil.copy2 para cada achado, na ordem encontrada.
-      Serial = sem seek concorrente = máximo throughput sequencial de escrita.
-    """
-    achados: list[Achado] = []
-    erros:   list[str]    = []
-
-    # ── Fase 1: Varredura ─────────────────────────────────────────────────────
-    stats["fase"] = "Varrendo"
-    stack: list[str] = [raiz]      # lista como stack — append/pop é O(1)
-
-    while stack and not parar.is_set():
-        dir_atual = stack.pop()    # DFS com stack — equivalente a BFS invertido
-                                   # Para BFS real: stack.pop(0) — mas O(n) em lista
-                                   # Use deque se quiser BFS estrito:
-                                   # from collections import deque; stack = deque([raiz])
-                                   # dir_atual = stack.popleft()
-
-        stats["pasta_atual"] = dir_atual
+        if batch_remover:
+            conn.executemany("DELETE FROM arquivos WHERE caminho = ?", [(c,) for c in batch_remover])
+            conn.commit()
 
         try:
-            with os.scandir(dir_atual) as it:
-                subdirs: list[str] = []
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        except Exception:
+            pass
 
-                for entry in it:
-                    if parar.is_set():
-                        break
+        stats.fase = "Concluído" if not parar.is_set() else "Interrompido"
+
+    def contar_total(self) -> int:
+        row = self._conn().execute("SELECT COUNT(*) FROM arquivos").fetchone()
+        return row[0]
+
+    def fechar(self):
+        if hasattr(self._local, "conn") and self._local.conn:
+            try:
+                self._local.conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+            except Exception:
+                pass
+            try:
+                self._local.conn.close()
+            except Exception:
+                pass
+            self._local.conn = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MÓDULO 2 — FILE INDEXER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FileIndexer:
+
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+
+    @staticmethod
+    def extrair_telefone(nome: str) -> str:
+        """Extrai todos os blocos numéricos >= 8 dígitos do nome do arquivo,
+        concatenados por '|', para que a busca por substring funcione."""
+        try:
+            stem = os.path.splitext(nome)[0]
+            blocos = re.findall(r'\d{8,}', stem)
+            return "|".join(blocos) if blocos else ""
+        except Exception:
+            return ""
+
+    def _obter_mtime_dir(self, caminho: str) -> Optional[float]:
+        try:
+            return os.stat(caminho).st_mtime
+        except OSError:
+            return None
+
+    def indexar(
+        self,
+        raiz: str,
+        stats: EstatisticasIndexacao,
+        parar: threading.Event,
+        pastas_nivel1_filtro: Optional[set] = None,
+    ) -> None:
+        ts_ultima = self.db.obter_timestamp_ultima_indexacao()
+        status_anterior = self.db.ler_metadata(META_STATUS_ULTIMA) or ""
+        foi_interrompido = status_anterior == "interrompido"
+        modo_incremental = ts_ultima is not None
+
+        dirs_concluidos: set[str] = set()
+        if foi_interrompido:
+            raw = self.db.ler_metadata(META_DIRS_CONCLUIDOS) or ""
+            if raw:
+                dirs_concluidos = set(raw.split("\n"))
+            ts_dir_skip = None
+            stats.fase = f"Retomando — {len(dirs_concluidos)} pastas já indexadas"
+        else:
+            ts_dir_skip = ts_ultima
+
+        if modo_incremental:
+            dt_str = datetime.fromtimestamp(ts_ultima).strftime("%d/%m/%Y %H:%M:%S")
+            stats.ultima_indexacao = dt_str
+            if not foi_interrompido:
+                stats.fase = f"Incremental — última: {dt_str}"
+        else:
+            stats.fase = "Indexação inicial..."
+
+        stack: list[tuple[str, Optional[float]]] = [(raiz, None)]
+        batch: list[ArquivoInfo] = []
+        ultima_pasta_visitada = raiz
+        nivel1_atual_processando = ""
+
+        try:
+            while stack and not parar.is_set():
+                dir_atual, dir_mtime_hint = stack.pop()
+                stats.pasta_atual     = dir_atual
+                ultima_pasta_visitada = dir_atual
+
+                nivel1_do_dir = ""
+                if dir_atual != raiz:
                     try:
-                        if entry.is_dir(follow_symlinks=False):
-                            subdirs.append(entry.path)
-                            continue
+                        rel = os.path.relpath(dir_atual, raiz)
+                        nivel1_do_dir = os.path.join(raiz, rel.split(os.sep)[0])
+                    except Exception:
+                        nivel1_do_dir = dir_atual
 
-                        # Filtragem por extensão — O(1) com frozenset
-                        nome = entry.name
-                        _, ext = os.path.splitext(nome)
-                        if ext.lower() not in EXTENSOES:
-                            stats["analisados"] += 1
-                            continue
+                if (pastas_nivel1_filtro is not None
+                        and nivel1_do_dir
+                        and nivel1_do_dir not in pastas_nivel1_filtro):
+                    stats.dirs_pulados += 1
+                    continue
 
-                        stats["analisados"] += 1
+                if foi_interrompido and nivel1_do_dir and nivel1_do_dir in dirs_concluidos:
+                    stats.dirs_pulados += 1
+                    continue
 
-                        # Match — Aho-Corasick O(len(nome)) em C
-                        if matcher(nome):
-                            destino_arquivo = os.path.join(destino, nome)
-                            achado = Achado(
-                                nome=nome,
-                                origem=entry.path,
-                                destino=destino_arquivo,
-                            )
-                            achados.append(achado)
-                            stats["encontrados"] += 1
+                if nivel1_do_dir and nivel1_do_dir != nivel1_atual_processando:
+                    nivel1_atual_processando = nivel1_do_dir
 
-                            # Cópia inline só se destino for disco diferente
-                            if COPIA_DURANTE_VARREDURA:
-                                _copiar(achado, erros)
+                if (not foi_interrompido and modo_incremental
+                        and ts_dir_skip is not None and dir_atual != raiz):
+                    dir_mtime = dir_mtime_hint
+                    if dir_mtime is None:
+                        dir_mtime = self._obter_mtime_dir(dir_atual)
+                    if dir_mtime is not None and dir_mtime <= (ts_dir_skip + MTIME_TOLERANCIA):
+                        stats.dirs_pulados += 1
+                        continue
 
-                    except (PermissionError, OSError):
-                        pass
+                stats.dirs_varridos += 1
 
-                # Empilha subdiretórios após processar dir atual
-                # Append em batch é mais eficiente que append individual
-                stack.extend(subdirs)
+                try:
+                    with os.scandir(dir_atual) as it:
+                        subdirs: list[tuple[str, Optional[float]]] = []
+                        for entry in it:
+                            if parar.is_set():
+                                break
+                            try:
+                                try:
+                                    entry_stat = entry.stat(follow_symlinks=False)
+                                except OSError:
+                                    continue
+                                if entry.is_dir(follow_symlinks=False):
+                                    subdirs.append((entry.path, entry_stat.st_mtime))
+                                    continue
+                                nome = entry.name
+                                _, ext = os.path.splitext(nome)
+                                if ext.lower() not in EXTENSOES:
+                                    continue
+                                stats.total_arquivos += 1
+                                mtime = entry_stat.st_mtime
+                                if modo_incremental and ts_ultima is not None and not foi_interrompido:
+                                    if mtime <= (ts_ultima + MTIME_TOLERANCIA):
+                                        stats.ignorados_mtime += 1
+                                        continue
+                                caminho = entry.path
+                                mtime_banco = self.db.arquivo_existe_no_banco(caminho)
+                                if mtime_banco is not None:
+                                    if abs(mtime_banco - mtime) < MTIME_TOLERANCIA:
+                                        stats.ignorados_mtime += 1
+                                        continue
+                                    stats.atualizados += 1
+                                    stats.fase = "Processando modificados..."
+                                else:
+                                    stats.novos += 1
+                                    stats.fase = "Processando novos..."
+                                telefone = self.extrair_telefone(nome)
+                                if not telefone:
+                                    continue
+                                batch.append(ArquivoInfo(
+                                    telefone=telefone, nome=nome, caminho=caminho,
+                                    extensao=ext.lower(), modificado_em=mtime,
+                                ))
+                                if len(batch) >= BATCH_SIZE:
+                                    self.db.inserir_batch(batch)
+                                    batch.clear()
+                                    self.db.salvar_metadata(META_ULTIMA_PASTA, dir_atual)
+                            except (PermissionError, OSError):
+                                pass
+                        stack.extend(subdirs)
+                except (PermissionError, OSError) as e:
+                    log.warning("Sem acesso: %s — %s", dir_atual, e)
 
-        except (PermissionError, OSError) as e:
-            log.warning("Sem acesso: %s — %s", dir_atual, e)
+                if foi_interrompido and nivel1_do_dir:
+                    restante = any(p.startswith(nivel1_do_dir + os.sep) or p == nivel1_do_dir for p, _ in stack)
+                    if not restante and nivel1_do_dir not in dirs_concluidos:
+                        dirs_concluidos.add(nivel1_do_dir)
+                        self.db.salvar_metadata(META_DIRS_CONCLUIDOS, "\n".join(dirs_concluidos))
 
-    # ── Fase 2: Cópia serial (se não copiou durante varredura) ───────────────
-    if not COPIA_DURANTE_VARREDURA and not parar.is_set():
-        stats["fase"] = "Copiando"
-        total_copiar = len(achados)
+        finally:
+            if batch:
+                try:
+                    self.db.inserir_batch(batch)
+                    batch.clear()
+                except Exception as e:
+                    log.warning("Falha no flush final: %s", e)
 
-        for i, achado in enumerate(achados):
+            if not parar.is_set():
+                self.db.salvar_metadata(META_DIRS_CONCLUIDOS, "")
+                self.db.salvar_checkpoint_indexacao(status="completo", pasta_atual=ultima_pasta_visitada)
+                stats.fase = "Concluído"
+            else:
+                self.db.salvar_metadata(META_STATUS_ULTIMA, "interrompido")
+                self.db.salvar_metadata(META_ULTIMA_PASTA, ultima_pasta_visitada)
+                agora_utc = datetime.now(timezone.utc).isoformat()
+                self.db.salvar_metadata(META_ULTIMA_INDEXACAO, agora_utc)
+                try:
+                    conn = self.db._conn()
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                    conn.commit()
+                except Exception as e:
+                    log.warning("wal_checkpoint no parar falhou: %s", e)
+                stats.fase = "Interrompido"
+            self.db.fechar()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MÓDULO 3 — SEARCH ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SearchEngine:
+
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+
+    @staticmethod
+    def carregar_numeros_planilha(caminho: str) -> Optional[list[str]]:
+        ext = os.path.splitext(caminho)[1].lower()
+        numeros: list[str] = []
+        try:
+            if ext == ".csv":
+                df = pd.read_csv(caminho, usecols=[0], dtype=str, header=None)
+            else:
+                df = pd.read_excel(caminho, usecols=[0], header=None)
+            for val in df.iloc[:, 0].dropna():
+                try:
+                    limpo = str(int(float(str(val).strip())))
+                except (ValueError, OverflowError):
+                    limpo = str(val).strip()
+                if limpo and limpo.lower() not in ("nan", "none", ""):
+                    numeros.append(limpo)
+            return numeros
+        except Exception as e:
+            log.exception("Erro ao carregar planilha: %s", caminho)
+            messagebox.showerror("Erro na planilha", str(e))
+            return None
+
+    def buscar_e_copiar(
+        self,
+        telefones: list[str],
+        destino: str,
+        stats: EstatisticasBusca,
+        parar: threading.Event,
+    ) -> list[ResultadoBusca]:
+        stats.total_numeros = len(telefones)
+        stats.fase = "Consultando índice..."
+
+        rows = self.db.buscar_batch(telefones)
+        stats.encontrados = len(rows)
+        stats.fase = f"Copiando {len(rows)} arquivo(s)..."
+
+        resultados: list[ResultadoBusca] = []
+        for i, row in enumerate(rows):
             if parar.is_set():
                 break
-            _copiar(achado, erros)
-            stats["copiados"] = i + 1
+            stats.copiados = i
+            nome     = row["nome"]
+            origem   = row["caminho"]
+            telefone = row["telefone"]
+            resultado = ResultadoBusca(telefone=telefone, nome=nome, caminho=origem)
+            if not os.path.exists(origem):
+                resultado.erro = "Arquivo não encontrado (índice desatualizado)"
+                stats.erros += 1
+                resultados.append(resultado)
+                continue
+            destino_arquivo = os.path.join(destino, nome)
+            try:
+                if not os.path.exists(destino_arquivo):
+                    shutil.copy2(origem, destino_arquivo)
+                resultado.copiado = True
+            except Exception as e:
+                resultado.erro = str(e)
+                stats.erros += 1
+                log.warning("Falha ao copiar %s: %s", nome, e)
+            resultados.append(resultado)
 
-    # Sinaliza conclusão via callback (thread-safe com root.after)
-    callback_fim(achados, erros)
+        stats.copiados = sum(1 for r in resultados if r.copiado)
+        stats.fase = "Concluído"
+        return resultados
 
 
-def _copiar(achado: Achado, erros: list[str]) -> None:
-    """
-    Cópia com verificação de existência.
-    shutil.copy2 preserva metadados (timestamps).
-    """
-    try:
-        if not os.path.exists(achado.destino):
-            shutil.copy2(achado.origem, achado.destino)
-    except Exception as e:
-        erros.append(f"✘ {achado.nome}: {e}")
-        log.warning("Falha ao copiar %s: %s", achado.nome, e)
+# ─────────────────────────────────────────────────────────────────────────────
+# MÓDULO 4 — DIRECTORY EVALUATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DirectoryEvaluator:
+
+    def __init__(self, db_path: str):
+        base = os.path.splitext(db_path)[0]
+        self.cache_path = base + AVALIACAO_CACHE_SUFIXO
+
+    def avaliar(self, raiz: str, resultado: ResultadoAvaliacao, parar: threading.Event) -> None:
+        ts_inicio = time.monotonic()
+        resultado.fase = "Varrendo diretório..."
+        resultado.cache_path = self.cache_path
+        stack: list[str] = [raiz]
+        por_nivel1: dict[str, dict] = {}
+
+        try:
+            while stack and not parar.is_set():
+                dir_atual = stack.pop()
+                resultado.pasta_atual = dir_atual
+                resultado.total_dirs += 1
+                nivel1 = ""
+                if dir_atual != raiz:
+                    try:
+                        rel = os.path.relpath(dir_atual, raiz)
+                        nivel1 = os.path.join(raiz, rel.split(os.sep)[0])
+                    except Exception:
+                        nivel1 = dir_atual
+                if nivel1 and nivel1 not in por_nivel1:
+                    por_nivel1[nivel1] = {"arquivos": 0, "bytes": 0}
+                try:
+                    with os.scandir(dir_atual) as it:
+                        for entry in it:
+                            if parar.is_set():
+                                break
+                            try:
+                                st = entry.stat(follow_symlinks=False)
+                            except OSError:
+                                continue
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                                continue
+                            _, ext = os.path.splitext(entry.name)
+                            if ext.lower() not in EXTENSOES:
+                                continue
+                            resultado.total_arquivos += 1
+                            resultado.tamanho_bytes  += st.st_size
+                            if nivel1:
+                                por_nivel1[nivel1]["arquivos"] += 1
+                                por_nivel1[nivel1]["bytes"]    += st.st_size
+                except (PermissionError, OSError) as e:
+                    log.warning("Avaliação sem acesso: %s — %s", dir_atual, e)
+        finally:
+            resultado.tempo_scan_s = time.monotonic() - ts_inicio
+            resultado.por_nivel1   = por_nivel1
+            resultado.fase = "Interrompido" if parar.is_set() else "Concluído"
+            self._salvar_cache(resultado)
+
+    def _salvar_cache(self, resultado: ResultadoAvaliacao) -> None:
+        try:
+            dados = {
+                "gerado_em":      datetime.now().isoformat(),
+                "total_arquivos": resultado.total_arquivos,
+                "total_dirs":     resultado.total_dirs,
+                "tamanho_bytes":  resultado.tamanho_bytes,
+                "tempo_scan_s":   resultado.tempo_scan_s,
+                "por_nivel1":     resultado.por_nivel1,
+                "fase":           resultado.fase,
+            }
+            with open(self.cache_path, "w", encoding="utf-8") as f:
+                json.dump(dados, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.warning("Falha ao salvar cache: %s", e)
+
+    def carregar_cache(self) -> Optional[dict]:
+        if not os.path.exists(self.cache_path):
+            return None
+        try:
+            with open(self.cache_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    @staticmethod
+    def formatar_tamanho(b: int) -> str:
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if b < 1024:
+                return f"{b:.1f} {unit}"
+            b /= 1024
+        return f"{b:.1f} PB"
+
+    @staticmethod
+    def estimar_tempo(total_arquivos: int) -> str:
+        segundos = total_arquivos / VELOCIDADE_ESTIMADA_ARQ_S
+        if segundos < 60:
+            return f"~{int(segundos)}s"
+        elif segundos < 3600:
+            return f"~{int(segundos/60)}min"
+        else:
+            h = int(segundos // 3600)
+            m = int((segundos % 3600) // 60)
+            return f"~{h}h {m}min"
 
 
-# INTERFACE TKINTER
+# ─────────────────────────────────────────────────────────────────────────────
+# MÓDULO 5 — TARGETED SCANNER
+# ─────────────────────────────────────────────────────────────────────────────
 
-class Buscador:
+class TargetedScanner:
+
+    _RE_SEGMENTOS = re.compile(r'^GRV_\d+_(\d+)_S__(.+?)(?:_\d+#|#)', re.IGNORECASE)
+
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+
+    @staticmethod
+    def normalizar_numero(n: str) -> str:
+        return re.sub(r'\D', '', str(n))
+
+    @classmethod
+    def extrair_candidatos(cls, nome_arquivo: str) -> list[str]:
+        """Retorna todos os blocos numéricos >= 8 dígitos encontrados no nome.
+        A correspondência com os números-alvo é feita por substring (ver varrer_e_salvar)."""
+        stem = os.path.splitext(nome_arquivo)[0]
+        blocos: set[str] = set()
+        for bloco in re.findall(r'\d{8,}', stem):
+            blocos.add(bloco)
+            # Remove prefixos internacionais comuns para ampliar o match
+            for prefixo in ('55', '0055', '0'):
+                if bloco.startswith(prefixo) and len(bloco) > len(prefixo) + 7:
+                    blocos.add(bloco[len(prefixo):])
+        return [b for b in blocos if b]
+
+    def varrer_e_salvar(
+        self,
+        raiz: str,
+        numeros_alvo: set[str],
+        stats: EstatisticasIndexacao,
+        parar: threading.Event,
+        callback_resultado: Optional[Callable] = None,
+    ) -> None:
+        batch: list[ArquivoInfo] = []
+        stack: list[str] = [raiz]
+        stats.fase = "Varrendo..."
+
+        try:
+            while stack and not parar.is_set():
+                dir_atual = stack.pop()
+                stats.pasta_atual = dir_atual
+                stats.dirs_varridos += 1
+                try:
+                    with os.scandir(dir_atual) as it:
+                        for entry in it:
+                            if parar.is_set():
+                                break
+                            try:
+                                st = entry.stat(follow_symlinks=False)
+                            except OSError:
+                                continue
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                                continue
+                            nome = entry.name
+                            _, ext = os.path.splitext(nome)
+                            if ext.lower() not in EXTENSOES:
+                                continue
+                            stats.total_arquivos += 1
+                            candidatos = self.extrair_candidatos(nome)
+                            numero_encontrado = None
+                            for alvo in numeros_alvo:
+                                for c in candidatos:
+                                    # Match se o alvo está dentro do bloco ou o bloco dentro do alvo
+                                    if alvo in c or c in alvo:
+                                        numero_encontrado = alvo
+                                        break
+                                if numero_encontrado:
+                                    break
+                            if numero_encontrado is None:
+                                stats.ignorados_mtime += 1
+                                continue
+                            stats.novos += 1
+                            info = ArquivoInfo(
+                                telefone=numero_encontrado, nome=nome, caminho=entry.path,
+                                extensao=ext.lower(), modificado_em=st.st_mtime,
+                            )
+                            batch.append(info)
+                            if callback_resultado:
+                                callback_resultado(info)
+                            if len(batch) >= BATCH_SIZE:
+                                self.db.inserir_batch(batch)
+                                batch.clear()
+                except (PermissionError, OSError) as e:
+                    log.warning("TargetedScanner sem acesso: %s — %s", dir_atual, e)
+        finally:
+            if batch:
+                try:
+                    self.db.inserir_batch(batch)
+                except Exception as e:
+                    log.warning("Flush final TargetedScanner falhou: %s", e)
+            if not parar.is_set():
+                self.db.salvar_checkpoint_indexacao(status="completo_targeted")
+                stats.fase = "Concluído"
+            else:
+                stats.fase = "Interrompido"
+            self.db.fechar()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERFACE — AudioSearcherApp  (2 abas)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AudioSearcherApp:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("Buscador de Gravações — HDD Edition")
+        root.title("Buscador de Gravações v4.0")
         root.resizable(True, True)
 
-        self._parar   = threading.Event()
-        self._stats   = {
-            "analisados": 0,
-            "encontrados": 0,
-            "copiados": 0,
-            "pasta_atual": "",
-            "fase": "Aguardando",
-        }
-        self._ts_inicio   = 0.0
+        self.db:      Optional[DatabaseManager] = None
+        self.indexer: Optional[FileIndexer]     = None
+        self.engine:  Optional[SearchEngine]    = None
+
+        self._parar     = threading.Event()
         self._after_id: Optional[str] = None
-        self._linhas_ui:  list[str]   = []  # buffer da Listbox
+
+        self._stats_idx  = EstatisticasIndexacao()
+        self._stats_bus  = EstatisticasBusca()
+        self._stats_limp = EstatisticasLimpeza()
+        self._ts_inicio  = 0.0
+        self._modo_ativo = ""
 
         self._build_ui()
 
-    # ── Construção da UI ──────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # BUILD UI
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        root = self.root
-        pad = ttk.Frame(root, padding=14)
-        pad.pack(fill="both", expand=True)
-        pad.columnconfigure(1, weight=1)
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("Accent.TButton",    font=("Segoe UI", 10, "bold"))
+        style.configure("Danger.TButton",    font=("Segoe UI", 9),  foreground="#cc2200")
+        style.configure("Info.TLabel",       font=("Segoe UI", 9),  foreground="#555555")
+        style.configure("Checkpoint.TLabel", font=("Segoe UI", 8, "italic"), foreground="#007700")
+        style.configure("Header.TLabel",     font=("Segoe UI", 9, "bold"),   foreground="#222")
 
-        # ── Campos de entrada ─────────────────────────────────────────────────
-        campos = [
-            ("Planilha (Coluna A):", "ent_planilha", None,            self._escolher_planilha),
-            ("Pasta de Busca:",      "ent_busca",    PASTA_PRINCIPAL,  self._escolher_busca),
-            ("Pasta de Destino:",    "ent_destino",  PASTA_DESTINO,    self._escolher_destino),
-        ]
-        for i, (label, attr, default, cmd) in enumerate(campos):
-            ttk.Label(pad, text=label).grid(row=i, column=0, sticky="w", pady=3)
-            ent = ttk.Entry(pad, width=72)
-            if default:
-                ent.insert(0, default)
-            ent.grid(row=i, column=1, padx=5, pady=3, sticky="ew")
-            ttk.Button(pad, text="…", width=3, command=cmd).grid(row=i, column=2)
-            setattr(self, attr, ent)
+        # ── Frame principal
+        main = ttk.Frame(self.root, padding=10)
+        main.pack(fill="both", expand=True)
 
-        # Aviso sobre pyahocorasick
-        aviso_cor = "green" if _AHO_DISPONIVEL else "red"
-        aviso_txt = (
-            "✔  pyahocorasick instalado — match Aho-Corasick em C (máxima velocidade)"
-            if _AHO_DISPONIVEL else
-            "⚠  pyahocorasick NÃO instalado — usando regex fallback (mais lento)\n"
-            "   Execute: pip install pyahocorasick"
-        )
-        lbl_aviso = ttk.Label(pad, text=aviso_txt, foreground=aviso_cor,
-                              font=("Consolas", 8))
-        lbl_aviso.grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 6))
+        # ── Banco de dados (topo, sempre visível) ─────────────────────────────
+        db_frame = ttk.LabelFrame(main, text=" Banco de Dados ", padding=8)
+        db_frame.pack(fill="x", pady=(0, 8))
+        db_frame.columnconfigure(1, weight=1)
 
-        # Opção: cópia durante varredura
-        self._var_copia_inline = tk.BooleanVar(value=COPIA_DURANTE_VARREDURA)
-        chk = ttk.Checkbutton(
-            pad,
-            text="Destino em disco diferente? (copiar durante varredura)",
-            variable=self._var_copia_inline,
-        )
-        chk.grid(row=4, column=0, columnspan=3, sticky="w", pady=2)
+        ttk.Label(db_frame, text="Arquivo do índice (.db):").grid(row=0, column=0, sticky="w", padx=(0,6))
+        self.ent_db = ttk.Entry(db_frame)
+        self.ent_db.insert(0, DB_PADRAO)
+        self.ent_db.grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(db_frame, text="…", width=3, command=self._escolher_db).grid(row=0, column=2)
+        ttk.Button(db_frame, text="✔ Verificar", command=self._verificar_banco, width=12).grid(row=0, column=3, padx=(6,0))
 
-        # Barra de progresso
-        ttk.Label(pad, text="Progresso:").grid(row=5, column=0, sticky="w", pady=5)
-        self.progressbar = ttk.Progressbar(
-            pad, orient="horizontal", mode="indeterminate", length=500)
-        self.progressbar.grid(row=5, column=1, columnspan=2, sticky="ew", pady=5)
+        self.lbl_status_db = ttk.Label(db_frame, text="Banco: não verificado", foreground="gray", font=("Segoe UI", 8))
+        self.lbl_status_db.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4,0))
 
-        # Fase + pasta atual
-        self.lbl_fase = ttk.Label(pad, text="Pronto.",
+        self.lbl_checkpoint = ttk.Label(db_frame, text="", style="Checkpoint.TLabel")
+        self.lbl_checkpoint.grid(row=2, column=0, columnspan=4, sticky="w")
+
+        # ── Notebook (abas) ───────────────────────────────────────────────────
+        self.notebook = ttk.Notebook(main)
+        self.notebook.pack(fill="both", expand=True)
+
+        self._tab_banco    = ttk.Frame(self.notebook, padding=10)
+        self._tab_varredura = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(self._tab_banco,    text="  📂  Banco & Busca  ")
+        self.notebook.add(self._tab_varredura, text="  🎯  Varredura Direcionada  ")
+
+        self._build_aba_banco(self._tab_banco)
+        self._build_aba_varredura(self._tab_varredura)
+
+        # ── Barra de progresso global (rodapé) ────────────────────────────────
+        rodape = ttk.Frame(main)
+        rodape.pack(fill="x", pady=(8, 0))
+
+        self.progressbar = ttk.Progressbar(rodape, orient="horizontal", mode="indeterminate")
+        self.progressbar.pack(fill="x")
+
+        self.lbl_fase = ttk.Label(rodape, text="Sistema pronto.",
                                   font=("Segoe UI", 9, "bold"), foreground="gray")
-        self.lbl_fase.grid(row=6, column=0, columnspan=3, sticky="w")
+        self.lbl_fase.pack(anchor="w", pady=(2, 0))
 
-        self.lbl_pasta = ttk.Label(pad, text="",
-                                   font=("Segoe UI", 8), foreground="gray",
-                                   anchor="w", width=90)
-        self.lbl_pasta.grid(row=7, column=0, columnspan=3, sticky="ew")
+        self.lbl_pasta = ttk.Label(rodape, text="", font=("Segoe UI", 8),
+                                   foreground="gray", anchor="w")
+        self.lbl_pasta.pack(fill="x")
 
-        # Botões
-        btn_frame = ttk.Frame(pad)
-        btn_frame.grid(row=8, column=0, columnspan=3, pady=8)
-        self.btn_iniciar = ttk.Button(btn_frame, text="▶  INICIAR",
-                                      command=self._iniciar, width=18)
-        self.btn_iniciar.pack(side="left", padx=8)
-        self.btn_parar = ttk.Button(btn_frame, text="⏹  PARAR",
-                                    command=self._parar_busca,
-                                    state="disabled", width=18)
-        self.btn_parar.pack(side="left", padx=8)
+        self.lbl_contadores = ttk.Label(rodape, text="—", font=("Consolas", 9))
+        self.lbl_contadores.pack(anchor="w")
 
-        # Contadores
-        self.lbl_contadores = ttk.Label(
-            pad, text="Analisados: 0   Encontrados: 0   Velocidade: —",
-            font=("Segoe UI", 9))
-        self.lbl_contadores.grid(row=9, column=0, columnspan=3,
-                                 sticky="w", pady=2)
-
-        # Listbox
-        lf = ttk.Frame(pad)
-        lf.grid(row=10, column=0, columnspan=3, sticky="nsew", pady=6)
+        # ── Listbox resultados ────────────────────────────────────────────────
+        lf = ttk.LabelFrame(main, text=" Resultados / Log ", padding=4)
+        lf.pack(fill="both", expand=True, pady=(6, 0))
         lf.rowconfigure(0, weight=1)
         lf.columnconfigure(0, weight=1)
-        pad.rowconfigure(10, weight=1)
 
-        self.lista = tk.Listbox(
-            lf,
-            width=130, height=12,
-            font=("Consolas", 9),
-            selectmode=tk.EXTENDED,
-            activestyle="none",
-        )
-        sb = ttk.Scrollbar(lf, orient="vertical", command=self.lista.yview)
-        self.lista.configure(yscrollcommand=sb.set)
+        self.lista = tk.Listbox(lf, font=("Consolas", 9), selectmode=tk.EXTENDED, activestyle="none")
+        sb_y = ttk.Scrollbar(lf, orient="vertical",   command=self.lista.yview)
+        sb_x = ttk.Scrollbar(lf, orient="horizontal", command=self.lista.xview)
+        self.lista.configure(yscrollcommand=sb_y.set, xscrollcommand=sb_x.set)
         self.lista.grid(row=0, column=0, sticky="nsew")
-        sb.grid(row=0, column=1, sticky="ns")
+        sb_y.grid(row=0, column=1, sticky="ns")
+        sb_x.grid(row=1, column=0, sticky="ew")
 
-    # ── Seletores de arquivo/pasta ────────────────────────────────────────────
+        self.root.after(300, self._verificar_banco)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ABA 1 — BANCO & BUSCA
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_aba_banco(self, parent: ttk.Frame):
+        parent.columnconfigure(1, weight=1)
+
+        # ── Indexador ─────────────────────────────────────────────────────────
+        idx_frame = ttk.LabelFrame(parent, text=" Indexador ", padding=8)
+        idx_frame.pack(fill="x", pady=(0, 10))
+        idx_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(idx_frame, text="Pasta raiz dos áudios:").grid(row=0, column=0, sticky="w", pady=3, padx=(0,6))
+        self.ent_raiz = ttk.Entry(idx_frame)
+        self.ent_raiz.insert(0, PASTA_PRINCIPAL_PADRAO)
+        self.ent_raiz.grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(idx_frame, text="…", width=3, command=self._escolher_raiz).grid(row=0, column=2)
+
+        btn_row = ttk.Frame(idx_frame)
+        btn_row.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6,0))
+
+        self.btn_indexar = ttk.Button(btn_row, text="⟳  Atualizar Índice",
+                                      command=self._iniciar_indexacao, width=22)
+        self.btn_indexar.pack(side="left", padx=(0,6))
+
+        self.btn_avaliar = ttk.Button(btn_row, text="📊  Avaliar Diretório",
+                                      command=self._abrir_janela_avaliacao, width=20)
+        self.btn_avaliar.pack(side="left", padx=(0,6))
+
+        self.btn_limpar = ttk.Button(btn_row, text="🗑  Limpar Órfãos",
+                                     command=self._iniciar_limpeza, width=18, style="Danger.TButton")
+        self.btn_limpar.pack(side="left", padx=(0,6))
+
+        self.btn_parar_idx = ttk.Button(btn_row, text="⏹  Parar",
+                                        command=self._parar_operacao, state="disabled", width=10)
+        self.btn_parar_idx.pack(side="left", padx=(0,6))
+
+        self.lbl_total_idx = ttk.Label(btn_row, text="Total indexado: —",
+                                       font=("Segoe UI", 9), foreground="#555")
+        self.lbl_total_idx.pack(side="left", padx=8)
+
+        # ── Busca ─────────────────────────────────────────────────────────────
+        bus_frame = ttk.LabelFrame(parent, text=" Busca por Planilha ", padding=8)
+        bus_frame.pack(fill="x")
+        bus_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(bus_frame, text="Planilha (col. A = números):").grid(row=0, column=0, sticky="w", pady=3, padx=(0,6))
+        self.ent_planilha = ttk.Entry(bus_frame)
+        self.ent_planilha.grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(bus_frame, text="…", width=3, command=self._escolher_planilha).grid(row=0, column=2)
+
+        ttk.Label(bus_frame, text="Pasta de destino:").grid(row=1, column=0, sticky="w", pady=3, padx=(0,6))
+        self.ent_destino = ttk.Entry(bus_frame)
+        self.ent_destino.insert(0, PASTA_DESTINO_PADRAO)
+        self.ent_destino.grid(row=1, column=1, sticky="ew", padx=4)
+        ttk.Button(bus_frame, text="…", width=3, command=self._escolher_destino).grid(row=1, column=2)
+
+        # Preview dos números carregados
+        self.lbl_numeros_carregados = ttk.Label(bus_frame, text="Nenhuma planilha carregada.",
+                                                font=("Segoe UI", 8), foreground="gray")
+        self.lbl_numeros_carregados.grid(row=2, column=0, columnspan=3, sticky="w", pady=(2,0))
+
+        btn_row2 = ttk.Frame(bus_frame)
+        btn_row2.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6,0))
+
+        ttk.Button(btn_row2, text="📋  Pré-visualizar Números",
+                   command=self._preview_planilha, width=24).pack(side="left", padx=(0,6))
+
+        self.btn_buscar = ttk.Button(btn_row2, text="🔍  Buscar e Copiar",
+                                     command=self._iniciar_busca, width=22, style="Accent.TButton")
+        self.btn_buscar.pack(side="left", padx=(0,6))
+
+        self.btn_parar_bus = ttk.Button(btn_row2, text="⏹  Parar",
+                                        command=self._parar_operacao, state="disabled", width=10)
+        self.btn_parar_bus.pack(side="left")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ABA 2 — VARREDURA DIRECIONADA
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_aba_varredura(self, parent: ttk.Frame):
+        parent.columnconfigure(1, weight=1)
+
+        info_frame = ttk.Frame(parent)
+        info_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(
+            info_frame,
+            text="Varre o HD em tempo real buscando apenas os números informados. "
+                 "Não requer banco indexado previamente.",
+            font=("Segoe UI", 9), foreground="#444", wraplength=700, justify="left",
+        ).pack(anchor="w")
+
+        scan_frame = ttk.LabelFrame(parent, text=" Configuração da Varredura ", padding=8)
+        scan_frame.pack(fill="x")
+        scan_frame.columnconfigure(1, weight=1)
+
+        # Planilha alvo
+        ttk.Label(scan_frame, text="Planilha de números-alvo:").grid(row=0, column=0, sticky="w", pady=4, padx=(0,6))
+        self.ent_alvo = ttk.Entry(scan_frame)
+        self.ent_alvo.grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(scan_frame, text="…", width=3, command=self._escolher_planilha_alvo).grid(row=0, column=2)
+
+        # Números diretos
+        ttk.Label(scan_frame, text="Ou digitar números\n(um por linha):").grid(row=1, column=0, sticky="nw", pady=4, padx=(0,6))
+        txt_frame = ttk.Frame(scan_frame)
+        txt_frame.grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+        txt_frame.columnconfigure(0, weight=1)
+        self.txt_numeros_diretos = tk.Text(txt_frame, width=50, height=5, font=("Consolas", 9))
+        sb_txt = ttk.Scrollbar(txt_frame, orient="vertical", command=self.txt_numeros_diretos.yview)
+        self.txt_numeros_diretos.configure(yscrollcommand=sb_txt.set)
+        self.txt_numeros_diretos.grid(row=0, column=0, sticky="ew")
+        sb_txt.grid(row=0, column=1, sticky="ns")
+
+        # Botão carregar/preview
+        ttk.Button(scan_frame, text="👁  Ver números carregados",
+                   command=self._preview_alvo, width=24).grid(row=1, column=2, sticky="n", padx=(4,0))
+
+        self.lbl_alvo_status = ttk.Label(scan_frame, text="Nenhum número carregado.",
+                                         font=("Segoe UI", 8), foreground="gray")
+        self.lbl_alvo_status.grid(row=2, column=0, columnspan=3, sticky="w", pady=(0,4))
+
+        # Pasta raiz para varrer
+        ttk.Label(scan_frame, text="Pasta raiz para varrer:").grid(row=3, column=0, sticky="w", pady=4, padx=(0,6))
+        self.ent_raiz_scan = ttk.Entry(scan_frame)
+        self.ent_raiz_scan.insert(0, PASTA_PRINCIPAL_PADRAO)
+        self.ent_raiz_scan.grid(row=3, column=1, sticky="ew", padx=4)
+        ttk.Button(scan_frame, text="…", width=3,
+                   command=lambda: self._escolher_dir(self.ent_raiz_scan)).grid(row=3, column=2)
+
+        # Pasta destino
+        ttk.Label(scan_frame, text="Pasta de destino (cópia):").grid(row=4, column=0, sticky="w", pady=4, padx=(0,6))
+        self.ent_dest_scan = ttk.Entry(scan_frame)
+        self.ent_dest_scan.insert(0, PASTA_DESTINO_PADRAO)
+        self.ent_dest_scan.grid(row=4, column=1, sticky="ew", padx=4)
+        ttk.Button(scan_frame, text="…", width=3,
+                   command=lambda: self._escolher_dir(self.ent_dest_scan)).grid(row=4, column=2)
+
+        # Botões ação
+        btn_row = ttk.Frame(scan_frame)
+        btn_row.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+        self.btn_scan_direto = ttk.Button(
+            btn_row, text="🎯  Varrer e Copiar Direto",
+            command=self._iniciar_scan_direcionado, width=26, style="Accent.TButton")
+        self.btn_scan_direto.pack(side="left", padx=(0, 8))
+
+        self.btn_parar_scan = ttk.Button(
+            btn_row, text="⏹  Parar",
+            command=self._parar_operacao, state="disabled", width=10)
+        self.btn_parar_scan.pack(side="left")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SELETORES DE ARQUIVO/PASTA
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _escolher_db(self):
+        p = filedialog.asksaveasfilename(
+            defaultextension=".db", filetypes=[("SQLite Database", "*.db")],
+            title="Escolher / criar banco de índice")
+        if p:
+            self.ent_db.delete(0, tk.END)
+            self.ent_db.insert(0, p)
+            self._verificar_banco()
+
+    def _escolher_raiz(self):
+        d = filedialog.askdirectory(title="Selecionar pasta raiz dos áudios")
+        if d:
+            self.ent_raiz.delete(0, tk.END)
+            self.ent_raiz.insert(0, d)
 
     def _escolher_planilha(self):
         p = filedialog.askopenfilename(
-            filetypes=[("Planilhas", "*.xlsx *.xls *.csv")])
+            filetypes=[("Planilhas", "*.xlsx *.xls *.csv"), ("Todos", "*.*")],
+            title="Selecionar planilha de números")
         if p:
             self.ent_planilha.delete(0, tk.END)
             self.ent_planilha.insert(0, p)
-
-    def _escolher_busca(self):
-        d = filedialog.askdirectory()
-        if d:
-            self.ent_busca.delete(0, tk.END)
-            self.ent_busca.insert(0, d)
+            self._atualizar_label_planilha(p)
 
     def _escolher_destino(self):
-        d = filedialog.askdirectory()
+        d = filedialog.askdirectory(title="Selecionar pasta de destino")
         if d:
             self.ent_destino.delete(0, tk.END)
             self.ent_destino.insert(0, d)
 
-    # ── Controle da busca ─────────────────────────────────────────────────────
+    def _escolher_planilha_alvo(self):
+        p = filedialog.askopenfilename(
+            filetypes=[("Planilhas", "*.xlsx *.xls *.csv"), ("Todos", "*.*")],
+            title="Selecionar planilha de números-alvo")
+        if p:
+            self.ent_alvo.delete(0, tk.END)
+            self.ent_alvo.insert(0, p)
+            self._atualizar_label_alvo(p)
 
-    def _iniciar(self):
+    def _escolher_dir(self, entry: ttk.Entry):
+        d = filedialog.askdirectory(title="Selecionar pasta")
+        if d:
+            entry.delete(0, tk.END)
+            entry.insert(0, d)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # HELPERS DE PLANILHA
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _atualizar_label_planilha(self, caminho: str):
+        try:
+            numeros = SearchEngine.carregar_numeros_planilha(caminho)
+            if numeros:
+                self.lbl_numeros_carregados.config(
+                    text=f"✔  {len(numeros):,} números carregados — ex: {', '.join(numeros[:3])}{'...' if len(numeros)>3 else ''}",
+                    foreground="green")
+            else:
+                self.lbl_numeros_carregados.config(text="⚠  Nenhum número encontrado.", foreground="orange")
+        except Exception as e:
+            self.lbl_numeros_carregados.config(text=f"✘  Erro: {e}", foreground="red")
+
+    def _atualizar_label_alvo(self, caminho: str):
+        try:
+            numeros = self._ler_planilha_alvo_raw(caminho)
+            if numeros:
+                self.lbl_alvo_status.config(
+                    text=f"✔  {len(numeros):,} números carregados da planilha — ex: {', '.join(numeros[:3])}{'...' if len(numeros)>3 else ''}",
+                    foreground="green")
+            else:
+                self.lbl_alvo_status.config(text="⚠  Nenhum número encontrado na planilha.", foreground="orange")
+        except Exception as e:
+            self.lbl_alvo_status.config(text=f"✘  Erro: {e}", foreground="red")
+
+    @staticmethod
+    def _ler_planilha_alvo_raw(caminho: str) -> list[str]:
+        ext = os.path.splitext(caminho)[1].lower()
+        if ext == ".csv":
+            df = pd.read_csv(caminho, usecols=[0], dtype=str, header=None)
+        else:
+            df = pd.read_excel(caminho, usecols=[0], dtype=str, header=None)
+        numeros = []
+        for val in df.iloc[:, 0].dropna():
+            limpo = str(val).strip().rstrip(".0")
+            if limpo:
+                numeros.append(limpo)
+        return numeros
+
+    def _preview_planilha(self):
+        caminho = self.ent_planilha.get().strip()
+        if not caminho or not os.path.exists(caminho):
+            messagebox.showerror("Erro", "Selecione uma planilha válida primeiro.")
+            return
+        numeros = SearchEngine.carregar_numeros_planilha(caminho)
+        if numeros is None:
+            return
+        self._mostrar_preview_numeros(numeros, "Números da planilha de busca")
+
+    def _preview_alvo(self):
+        numeros_alvo = self._carregar_numeros_alvo(silencioso=True)
+        if numeros_alvo is None:
+            messagebox.showwarning("Aviso", "Informe os números pela planilha ou pela caixa de texto.")
+            return
+        self._mostrar_preview_numeros(sorted(numeros_alvo), "Números para varredura direcionada")
+
+    def _mostrar_preview_numeros(self, numeros: list[str], titulo: str):
+        win = tk.Toplevel(self.root)
+        win.title(titulo)
+        win.geometry("420x500")
+        win.resizable(True, True)
+        pad = ttk.Frame(win, padding=10)
+        pad.pack(fill="both", expand=True)
+        pad.rowconfigure(1, weight=1)
+        pad.columnconfigure(0, weight=1)
+
+        ttk.Label(pad, text=f"Total: {len(numeros):,} números", font=("Segoe UI", 9, "bold")).grid(row=0, sticky="w", pady=(0,6))
+
+        lb = tk.Listbox(pad, font=("Consolas", 9))
+        sb = ttk.Scrollbar(pad, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        lb.grid(row=1, column=0, sticky="nsew")
+        sb.grid(row=1, column=1, sticky="ns")
+
+        for n in numeros[:5000]:
+            lb.insert(tk.END, n)
+        if len(numeros) > 5000:
+            lb.insert(tk.END, f"... (+{len(numeros)-5000:,} mais)")
+
+        ttk.Button(pad, text="Fechar", command=win.destroy).grid(row=2, sticky="e", pady=(6,0))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # BANCO
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _verificar_banco(self):
+        db_path = self.ent_db.get().strip()
+        if not db_path:
+            return
+        try:
+            db    = DatabaseManager(db_path)
+            total = db.contar_total()
+            ts_checkpoint = db.obter_timestamp_ultima_indexacao()
+            status_ultimo = db.ler_metadata(META_STATUS_ULTIMA) or "—"
+            db.fechar()
+
+            if total > 0:
+                self.lbl_status_db.config(
+                    text=f"✔  Banco encontrado — {total:,} arquivos indexados",
+                    foreground="green")
+                self.lbl_total_idx.config(text=f"Total indexado: {total:,}")
+                if ts_checkpoint:
+                    dt_str = datetime.fromtimestamp(ts_checkpoint).strftime("%d/%m/%Y às %H:%M:%S")
+                    cor   = "green"  if status_ultimo == "completo" else "orange"
+                    icone = "✔"     if status_ultimo == "completo" else "⚠"
+                    self.lbl_checkpoint.config(
+                        text=f"{icone}  Última indexação: {dt_str} ({status_ultimo})",
+                        foreground=cor)
+                else:
+                    self.lbl_checkpoint.config(
+                        text="⚠  Sem checkpoint — próxima indexação será completa",
+                        foreground="orange")
+            else:
+                self.lbl_status_db.config(
+                    text="⚠  Banco vazio — execute 'Atualizar Índice' primeiro",
+                    foreground="orange")
+                self.lbl_checkpoint.config(text="", foreground="gray")
+        except Exception as e:
+            self.lbl_status_db.config(text=f"✘  Erro ao verificar banco: {e}", foreground="red")
+            self.lbl_checkpoint.config(text="", foreground="gray")
+
+    def _get_db(self) -> Optional[DatabaseManager]:
+        db_path = self.ent_db.get().strip()
+        if not db_path:
+            messagebox.showerror("Erro", "Informe o caminho do banco de dados.")
+            return None
+        try:
+            return DatabaseManager(db_path)
+        except Exception as e:
+            messagebox.showerror("Erro no banco", str(e))
+            return None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # INDEXAÇÃO
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _iniciar_indexacao(self, pastas_nivel1_filtro: Optional[set] = None):
+        raiz = self.ent_raiz.get().strip()
+        if not os.path.isdir(raiz):
+            messagebox.showerror("Erro", "Pasta raiz inválida ou inexistente.")
+            return
+        db = self._get_db()
+        if db is None:
+            return
+        self.db      = db
+        self.indexer = FileIndexer(db)
+        self._pastas_nivel1_filtro = pastas_nivel1_filtro
+        self._parar.clear()
+        self._stats_idx  = EstatisticasIndexacao()
+        self._ts_inicio  = time.monotonic()
+        self._modo_ativo = "indexando"
+        self.lista.delete(0, tk.END)
+        self._set_ui_ativa(modo="indexando")
+        threading.Thread(target=self._worker_indexacao, args=(raiz,), daemon=True, name="Indexador").start()
+        self._agendar_ui()
+
+    def _worker_indexacao(self, raiz: str):
+        filtro = getattr(self, "_pastas_nivel1_filtro", None)
+        try:
+            self.indexer.indexar(raiz, self._stats_idx, self._parar, pastas_nivel1_filtro=filtro)
+        except Exception as e:
+            log.exception("Erro crítico na indexação: %s", e)
+            self._stats_idx.fase = f"ERRO: {e}"
+            try:
+                if self.db:
+                    self.db.fechar()
+            except Exception:
+                pass
+        finally:
+            self.root.after(0, self._finalizar_indexacao)
+
+    def _finalizar_indexacao(self):
+        self._cancelar_timer_ui()
+        self._set_ui_inativa()
+        s       = self._stats_idx
+        elapsed = max(time.monotonic() - self._ts_inicio, 0.01)
+        vel     = int(s.total_arquivos / elapsed)
+        total_banco = self.db.contar_total() if self.db else 0
+        total_dirs  = s.dirs_varridos + s.dirs_pulados
+        pct_pulados = (s.dirs_pulados / total_dirs * 100) if total_dirs > 0 else 0
+        pct_ignorados = (s.ignorados_mtime / s.total_arquivos * 100) if s.total_arquivos > 0 else 0
+
+        self.lbl_fase.config(text="Indexação concluída.", foreground="green")
+        self.lbl_total_idx.config(text=f"Total indexado: {total_banco:,}")
+        self._verificar_banco()
+
+        linhas = [
+            "INDEXAÇÃO CONCLUÍDA",
+            f"  Modo              : {'Incremental' if s.ultima_indexacao else 'Completo (inicial)'}",
+            f"  Dirs varridos     : {s.dirs_varridos:,}",
+            f"  Dirs pulados      : {s.dirs_pulados:,}  ({pct_pulados:.1f}%)",
+            f"  Arq. encontrados  : {s.total_arquivos:,}",
+            f"  Arq. ignorados    : {s.ignorados_mtime:,}  ({pct_ignorados:.1f}%)",
+            f"  Novos             : {s.novos:,}",
+            f"  Atualizados       : {s.atualizados:,}",
+            f"  Total banco       : {total_banco:,}",
+            f"  Tempo total       : {elapsed:.1f}s",
+            f"  Velocidade        : {vel:,} arq/s",
+        ]
+        self.lista.delete(0, tk.END)
+        self.lista.insert(tk.END, *linhas)
+
+        messagebox.showinfo("Indexação concluída",
+            f"Novos: {s.novos:,}   Atualizados: {s.atualizados:,}\n"
+            f"Dirs pulados: {s.dirs_pulados:,} ({pct_pulados:.1f}%)\n"
+            f"Total banco: {total_banco:,}\n"
+            f"Tempo: {elapsed:.1f}s  |  Vel: {vel:,} arq/s")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # LIMPEZA
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _iniciar_limpeza(self):
+        db = self._get_db()
+        if db is None:
+            return
+        if not db.banco_existe_com_dados():
+            messagebox.showinfo("Aviso", "O banco está vazio.")
+            db.fechar()
+            return
+        total = db.contar_total()
+        if not messagebox.askyesno("Limpar Órfãos",
+            f"Verificará {total:,} caminhos no disco para remover arquivos deletados.\n\nContinuar?"):
+            db.fechar()
+            return
+        self.db = db
+        self._parar.clear()
+        self._stats_limp = EstatisticasLimpeza()
+        self._ts_inicio  = time.monotonic()
+        self._modo_ativo = "limpando"
+        self.lista.delete(0, tk.END)
+        self._set_ui_ativa(modo="limpando")
+        threading.Thread(target=self._worker_limpeza, daemon=True, name="Limpeza").start()
+        self._agendar_ui()
+
+    def _worker_limpeza(self):
+        try:
+            self.db.remover_inexistentes(self._stats_limp, self._parar)
+        except Exception as e:
+            log.exception("Erro na limpeza: %s", e)
+            self._stats_limp.fase = f"ERRO: {e}"
+        finally:
+            self.root.after(0, self._finalizar_limpeza)
+
+    def _finalizar_limpeza(self):
+        self._cancelar_timer_ui()
+        self._set_ui_inativa()
+        s       = self._stats_limp
+        elapsed = max(time.monotonic() - self._ts_inicio, 0.01)
+        total_banco = self.db.contar_total() if self.db else 0
+        self.lbl_fase.config(text="Limpeza concluída.", foreground="green")
+        self.lbl_total_idx.config(text=f"Total indexado: {total_banco:,}")
+        linhas = ["LIMPEZA DE ÓRFÃOS CONCLUÍDA",
+                  f"  Verificados : {s.total_verificados:,}",
+                  f"  Removidos   : {s.removidos:,}",
+                  f"  Restantes   : {total_banco:,}",
+                  f"  Tempo       : {elapsed:.1f}s"]
+        self.lista.delete(0, tk.END)
+        self.lista.insert(tk.END, *linhas)
+        messagebox.showinfo("Limpeza concluída",
+            f"Verificados: {s.total_verificados:,}\nRemovidos: {s.removidos:,}\n"
+            f"Restantes: {total_banco:,}\nTempo: {elapsed:.1f}s")
+        self._verificar_banco()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # BUSCA
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _iniciar_busca(self):
         planilha = self.ent_planilha.get().strip()
         if not planilha or not os.path.exists(planilha):
-            messagebox.showerror("Erro", "Selecione uma planilha válida.")
+            messagebox.showerror("Erro",
+                "Selecione uma planilha válida.\n\n"
+                "Clique em '…' ao lado do campo 'Planilha' para escolher o arquivo.")
             return
 
-        pasta_busca = self.ent_busca.get().strip()
-        if not os.path.isdir(pasta_busca):
-            messagebox.showerror("Erro", "Pasta de busca inválida.")
+        destino = self.ent_destino.get().strip()
+        if not destino:
+            messagebox.showerror("Erro", "Informe a pasta de destino.")
             return
 
-        numeros = carregar_numeros(planilha)
-        if not numeros:
+        db = self._get_db()
+        if db is None:
+            return
+        if not db.banco_existe_com_dados():
+            messagebox.showwarning("Índice vazio",
+                "O banco ainda não possui dados.\nExecute 'Atualizar Índice' primeiro.")
+            db.fechar()
+            return
+
+        engine  = SearchEngine(db)
+        numeros = engine.carregar_numeros_planilha(planilha)
+        if numeros is None:
+            db.fechar()
             return
         if not numeros:
             messagebox.showerror("Erro", "Nenhum número encontrado na planilha.")
+            db.fechar()
             return
 
-        matcher = construir_matcher(numeros)
-
-        destino = self.ent_destino.get().strip()
         os.makedirs(destino, exist_ok=True)
-
-        # Propaga flag de cópia inline para o worker
-        global COPIA_DURANTE_VARREDURA
-        COPIA_DURANTE_VARREDURA = self._var_copia_inline.get()
-
-        # Reset de estado
+        self.db     = db
+        self.engine = engine
         self._parar.clear()
-        self._stats.update(
-            analisados=0, encontrados=0, copiados=0,
-            pasta_atual="", fase="Varrendo"
-        )
-        self._linhas_ui.clear()
+        self._stats_bus  = EstatisticasBusca()
+        self._ts_inicio  = time.monotonic()
+        self._modo_ativo = "buscando"
         self.lista.delete(0, tk.END)
-        self._ts_inicio = time.monotonic()
-
-        self.btn_iniciar.config(state="disabled")
-        self.btn_parar.config(state="normal")
-        self.progressbar.start(15)
-        self.lbl_fase.config(text="Varrendo…", foreground="blue")
-
-        # Thread única de I/O
-        threading.Thread(
-            target=worker,
-            args=(pasta_busca, destino, matcher,
-                  self._parar, self._stats, self._on_fim),
-            daemon=True,
-            name="IOWorker",
-        ).start()
-
-        # Timer de UI — 1 atualização por segundo
+        self.lista.insert(tk.END, f"Buscando {len(numeros):,} números no índice...")
+        self._set_ui_ativa(modo="buscando")
+        threading.Thread(target=self._worker_busca, args=(numeros, destino),
+                         daemon=True, name="Busca").start()
         self._agendar_ui()
 
-    def _parar_busca(self):
-        self._parar.set()
-        self.lbl_fase.config(text="Parando…", foreground="orange")
-        self.btn_parar.config(state="disabled")
+    def _worker_busca(self, numeros: list[str], destino: str):
+        resultados: list[ResultadoBusca] = []
+        try:
+            resultados = self.engine.buscar_e_copiar(numeros, destino, self._stats_bus, self._parar)
+        except Exception as e:
+            log.exception("Erro crítico na busca: %s", e)
+            self._stats_bus.fase = f"ERRO: {e}"
+        finally:
+            self.root.after(0, lambda: self._finalizar_busca(resultados, destino))
 
-    # ── Timer de UI — 1 Hz, não polui o GIL ──────────────────────────────────
-
-    def _agendar_ui(self):
-        self._after_id = self.root.after(
-            int(UI_INTERVALO_S * 1000), self._atualizar_ui)
-
-    def _atualizar_ui(self):
-        """
-        Roda na thread principal, 1x por segundo.
-
-        Lê stats do worker sem lock porque:
-          - stats é um dict Python
-          - Leituras e escritas de objetos Python são atômicas no CPython
-            (GIL garante atomicidade de LOAD/STORE de referências)
-          - Não há risco de leitura de estado corrompido
-          - No pior caso, o valor está um ciclo desatualizado (irrelevante para UI)
-
-        NÃO fazemos insert() na Listbox aqui — apenas contadores.
-        A Listbox recebe dados apenas no callback _on_fim (quando a busca termina).
-        Isso elimina completamente o overhead de redesenho da Listbox durante
-        a varredura, que era um dos maiores gargalos da versão anterior.
-        """
-        s = self._stats
+    def _finalizar_busca(self, resultados: list[ResultadoBusca], destino: str):
+        self._cancelar_timer_ui()
+        self._set_ui_inativa()
+        s       = self._stats_bus
         elapsed = max(time.monotonic() - self._ts_inicio, 0.01)
-        vel = int(s["analisados"] / elapsed)
-        fase = s["fase"]
+        self.lbl_fase.config(text=f"Busca concluída em {elapsed:.2f}s.", foreground="green")
 
-        self.lbl_fase.config(
-            text=f"{fase}…  {'Copiados: ' + str(s['copiados']) if fase == 'Copiando' else ''}",
-            foreground="blue",
-        )
+        linhas = [
+            f"{'─'*70}",
+            f"  BUSCA CONCLUÍDA — {elapsed:.3f}s",
+            f"  Números buscados  : {s.total_numeros:,}",
+            f"  Arquivos no índice: {s.encontrados:,}",
+            f"  Copiados          : {s.copiados:,}",
+            f"  Erros             : {s.erros:,}",
+            f"{'─'*70}",
+        ]
+        for r in resultados:
+            if r.copiado and len(linhas) < MAX_LINHAS_UI:
+                linhas.append(f"  ✔  [{r.telefone}]  {r.nome}")
+        for r in resultados:
+            if r.erro and len(linhas) < MAX_LINHAS_UI + 200:
+                linhas.append(f"  ✘  {r.nome} — {r.erro}")
 
-        pasta = s["pasta_atual"]
-        if pasta:
-            exibir = ("…" + pasta[-85:]) if len(pasta) > 88 else pasta
-            self.lbl_pasta.config(text=exibir)
+        self.lista.delete(0, tk.END)
+        if linhas:
+            self.lista.insert(tk.END, *linhas)
+            self.lista.yview_moveto(0.0)
 
         self.lbl_contadores.config(
-            text=(
-                f"Analisados: {s['analisados']:,}   "
-                f"Encontrados: {s['encontrados']:,}   "
-                f"Velocidade: {vel:,} arq/s   "
-                f"Tempo: {elapsed:.0f}s"
-            )
+            text=(f"Buscados: {s.total_numeros:,}   Encontrados: {s.encontrados:,}   "
+                  f"Copiados: {s.copiados:,}   Erros: {s.erros:,}   Tempo: {elapsed:.3f}s"))
+
+        msg = (f"Busca concluída!\n\n"
+               f"Números buscados  : {s.total_numeros:,}\n"
+               f"Arquivos no índice: {s.encontrados:,}\n"
+               f"Copiados          : {s.copiados:,}\n"
+               f"Erros             : {s.erros:,}\n"
+               f"Tempo total       : {elapsed:.3f}s")
+        if s.erros:
+            msg += f"\n\n⚠ {s.erros} erro(s) — veja a lista."
+        messagebox.showinfo("Busca concluída", msg)
+
+        if s.copiados > 0 and os.path.isdir(destino):
+            try:
+                subprocess.Popen(["explorer", os.path.normpath(destino)])
+            except Exception:
+                pass
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AVALIAÇÃO DE DIRETÓRIO
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _abrir_janela_avaliacao(self):
+        raiz = self.ent_raiz.get().strip()
+        if not os.path.isdir(raiz):
+            messagebox.showerror("Erro", "Pasta raiz inválida ou inexistente.")
+            return
+        db_path = self.ent_db.get().strip()
+        if not db_path:
+            messagebox.showerror("Erro", "Informe o caminho do banco de dados.")
+            return
+
+        avaliador = DirectoryEvaluator(db_path)
+        cache = avaliador.carregar_cache()
+        if cache:
+            dt_cache = cache.get("gerado_em", "")[:19].replace("T", " às ")
+            if messagebox.askyesno("Cache encontrado",
+                f"Existe avaliação salva de {dt_cache}.\nUsar esse resultado?"):
+                self._mostrar_resultado_avaliacao(cache, avaliador, raiz, db_path, de_cache=True)
+                return
+
+        win = tk.Toplevel(self.root)
+        win.title("Avaliando...")
+        win.geometry("520x160")
+        win.resizable(False, False)
+        win.grab_set()
+
+        pad = ttk.Frame(win, padding=18)
+        pad.pack(fill="both", expand=True)
+        ttk.Label(pad, text="Varrendo diretório para avaliação...", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        pb = ttk.Progressbar(pad, orient="horizontal", mode="indeterminate", length=480)
+        pb.pack(fill="x", pady=8)
+        pb.start(12)
+        lbl_info  = ttk.Label(pad, text="Iniciando...", font=("Consolas", 8), foreground="#555")
+        lbl_info.pack(anchor="w")
+        lbl_pasta = ttk.Label(pad, text="", font=("Consolas", 7), foreground="gray", anchor="w", width=70)
+        lbl_pasta.pack(anchor="w")
+        parar_ev  = threading.Event()
+        ttk.Button(pad, text="Cancelar", command=lambda: parar_ev.set()).pack(anchor="e", pady=(6,0))
+
+        resultado = ResultadoAvaliacao()
+        ts_ini    = time.monotonic()
+
+        def _tick():
+            if resultado.fase in ("Concluído", "Interrompido"):
+                win.destroy()
+                if resultado.fase == "Concluído":
+                    self._mostrar_resultado_avaliacao(avaliador.carregar_cache(), avaliador, raiz, db_path, de_cache=False)
+                return
+            elapsed = time.monotonic() - ts_ini
+            lbl_info.config(text=(f"Dirs: {resultado.total_dirs:,}   Arquivos: {resultado.total_arquivos:,}   "
+                                  f"Tamanho: {DirectoryEvaluator.formatar_tamanho(resultado.tamanho_bytes)}   "
+                                  f"Tempo: {elapsed:.0f}s"))
+            pasta = resultado.pasta_atual
+            if pasta:
+                lbl_pasta.config(text=("…" + pasta[-65:]) if len(pasta) > 68 else pasta)
+            win.after(600, _tick)
+
+        threading.Thread(target=avaliador.avaliar, args=(raiz, resultado, parar_ev), daemon=True).start()
+        win.after(600, _tick)
+
+    def _mostrar_resultado_avaliacao(self, cache, avaliador, raiz, db_path, de_cache):
+        if not cache:
+            messagebox.showerror("Erro", "Não foi possível carregar resultado.")
+            return
+        total_arq   = cache.get("total_arquivos", 0)
+        total_bytes = cache.get("tamanho_bytes", 0)
+        tempo_scan  = cache.get("tempo_scan_s", 0)
+        por_nivel1  = cache.get("por_nivel1", {})
+        fase        = cache.get("fase", "")
+        dt_cache    = cache.get("gerado_em", "")[:19].replace("T", " às ")
+        fmt = DirectoryEvaluator.formatar_tamanho
+
+        win = tk.Toplevel(self.root)
+        win.title("Resultado da Avaliação")
+        win.geometry("900x620")
+        win.resizable(True, True)
+        pad = ttk.Frame(win, padding=14)
+        pad.pack(fill="both", expand=True)
+        pad.columnconfigure(0, weight=1)
+        pad.rowconfigure(3, weight=1)
+
+        origem_txt = "📁 cache" if de_cache else "🔍 varredura nova"
+        ttk.Label(pad, text=f"Avaliação — {origem_txt} — {dt_cache}",
+                  font=("Segoe UI", 9, "italic"), foreground="gray").grid(row=0, sticky="w", pady=(0,4))
+
+        resumo = (f"Total de arquivos  : {total_arq:,}\n"
+                  f"Tamanho total      : {fmt(total_bytes)}\n"
+                  f"Tempo de varredura : {tempo_scan:.1f}s\n"
+                  f"Tempo est. indexar : {DirectoryEvaluator.estimar_tempo(total_arq)}\n"
+                  f"Pastas nível 1     : {len(por_nivel1):,}")
+        if fase == "Interrompido":
+            resumo += "\n⚠  Varredura interrompida — resultado parcial"
+        ttk.Label(pad, text=resumo, font=("Consolas", 9), justify="left",
+                  relief="groove", padding=10).grid(row=1, sticky="ew", pady=(0,8))
+
+        ttk.Label(pad, text="Detalhamento por pasta nível 1 (selecione as que deseja indexar):",
+                  font=("Segoe UI", 9)).grid(row=2, sticky="w", pady=(0,4))
+
+        tf = ttk.Frame(pad)
+        tf.grid(row=3, sticky="nsew", pady=(0,8))
+        tf.columnconfigure(0, weight=1)
+        tf.rowconfigure(0, weight=1)
+
+        cols = ("pasta", "arquivos", "tamanho", "tempo_est", "pct")
+        tree = ttk.Treeview(tf, columns=cols, show="headings", selectmode="extended", height=14)
+        for col, txt, w, anc in [
+            ("pasta","Pasta nível 1",380,"w"),("arquivos","Arquivos",90,"e"),
+            ("tamanho","Tamanho",100,"e"),("tempo_est","Tempo est.",100,"center"),("pct","% total",80,"center")]:
+            tree.heading(col, text=txt)
+            tree.column(col, width=w, anchor=anc)
+        sb = ttk.Scrollbar(tf, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+
+        for caminho, info in sorted(por_nivel1.items(), key=lambda x: x[1]["arquivos"], reverse=True):
+            arq = info["arquivos"]
+            pct = (arq / total_arq * 100) if total_arq > 0 else 0
+            tree.insert("", "end", iid=caminho, values=(
+                os.path.basename(caminho) or caminho,
+                f"{arq:,}", fmt(info["bytes"]),
+                DirectoryEvaluator.estimar_tempo(arq), f"{pct:.1f}%"))
+        tree.selection_set(tree.get_children())
+
+        rod = ttk.Frame(pad)
+        rod.grid(row=4, sticky="ew")
+        rod.columnconfigure(0, weight=1)
+        lbl_sel = ttk.Label(rod, text="", font=("Consolas", 9))
+        lbl_sel.grid(row=0, sticky="w")
+
+        def _upd(e=None):
+            sel = tree.selection()
+            a = sum(por_nivel1[s]["arquivos"] for s in sel if s in por_nivel1)
+            b = sum(por_nivel1[s]["bytes"]    for s in sel if s in por_nivel1)
+            lbl_sel.config(text=(f"Selecionados: {len(sel):,} pastas   Arquivos: {a:,}   "
+                                 f"Tamanho: {fmt(b)}   Tempo est.: {DirectoryEvaluator.estimar_tempo(a)}"))
+        tree.bind("<<TreeviewSelect>>", _upd)
+        _upd()
+
+        bf = ttk.Frame(rod)
+        bf.grid(row=1, sticky="e", pady=(8,0))
+        ttk.Button(bf, text="Selecionar tudo",
+                   command=lambda: (tree.selection_set(tree.get_children()), _upd())).pack(side="left", padx=4)
+        ttk.Button(bf, text="Desmarcar tudo",
+                   command=lambda: (tree.selection_remove(tree.get_children()), _upd())).pack(side="left", padx=4)
+
+        def _iniciar():
+            sel = list(tree.selection())
+            if not sel:
+                messagebox.showwarning("Aviso", "Nenhuma pasta selecionada.")
+                return
+            win.destroy()
+            self._iniciar_indexacao(pastas_nivel1_filtro=set(sel))
+
+        ttk.Button(bf, text="▶  Indexar selecionadas", style="Accent.TButton",
+                   command=_iniciar).pack(side="left", padx=(12,0))
+        ttk.Button(bf, text="Fechar", command=win.destroy).pack(side="left", padx=4)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # VARREDURA DIRECIONADA
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _carregar_numeros_alvo(self, silencioso: bool = False) -> Optional[set[str]]:
+        numeros: list[str] = []
+
+        planilha = self.ent_alvo.get().strip()
+        if planilha and os.path.exists(planilha):
+            try:
+                numeros.extend(self._ler_planilha_alvo_raw(planilha))
+            except Exception as e:
+                messagebox.showerror("Erro na planilha", f"Não foi possível ler:\n{e}")
+                return None
+
+        texto_direto = self.txt_numeros_diretos.get("1.0", "end").strip()
+        if texto_direto:
+            for linha in texto_direto.splitlines():
+                linha = linha.strip()
+                if linha:
+                    numeros.append(linha)
+
+        if not numeros:
+            return None
+
+        normalizados = {TargetedScanner.normalizar_numero(n) for n in numeros}
+        normalizados.discard("")
+
+        self.lbl_alvo_status.config(
+            text=f"✔  {len(normalizados):,} números únicos prontos para varredura.",
+            foreground="green")
+
+        if not silencioso:
+            messagebox.showinfo("Números carregados",
+                f"{len(normalizados):,} números únicos carregados para varredura.")
+        return normalizados
+
+    def _iniciar_scan_direcionado(self):
+        raiz = self.ent_raiz_scan.get().strip()
+        if not os.path.isdir(raiz):
+            messagebox.showerror("Erro", "Pasta raiz para varredura inválida.")
+            return
+        destino = self.ent_dest_scan.get().strip()
+        if not destino:
+            messagebox.showerror("Erro", "Informe a pasta de destino.")
+            return
+
+        numeros_alvo = self._carregar_numeros_alvo()
+        if not numeros_alvo:
+            messagebox.showerror("Erro",
+                "Nenhum número carregado.\n\nInforme os números pela planilha ou pela caixa de texto.")
+            return
+
+        db = self._get_db()
+        if db is None:
+            return
+
+        os.makedirs(destino, exist_ok=True)
+        self.db = db
+        self._scanner_direto = TargetedScanner(db)
+        self._destino_scan   = destino
+        self._numeros_alvo   = numeros_alvo
+        self._resultados_scan: list[ResultadoBusca] = []
+
+        self._parar.clear()
+        self._stats_idx  = EstatisticasIndexacao()
+        self._ts_inicio  = time.monotonic()
+        self._modo_ativo = "scan_direcionado"
+
+        self.lista.delete(0, tk.END)
+        self.lista.insert(tk.END,
+            "🎯  VARREDURA DIRECIONADA INICIADA",
+            f"    Números-alvo  : {len(numeros_alvo):,}",
+            f"    Raiz          : {raiz}",
+            f"    Destino       : {destino}",
+            "─" * 80,
         )
+        self._set_ui_ativa(modo="scan_direcionado")
+        threading.Thread(target=self._worker_scan_direcionado, args=(raiz,),
+                         daemon=True, name="ScanDirecionado").start()
+        self._agendar_ui()
+
+    def _worker_scan_direcionado(self, raiz: str):
+        try:
+            self._scanner_direto.varrer_e_salvar(
+                raiz=raiz,
+                numeros_alvo=self._numeros_alvo,
+                stats=self._stats_idx,
+                parar=self._parar,
+                callback_resultado=self._on_arquivo_encontrado_thread,
+            )
+        except Exception as e:
+            log.exception("Erro crítico no scan: %s", e)
+            self._stats_idx.fase = f"ERRO: {e}"
+        finally:
+            self.root.after(0, self._finalizar_scan_direcionado)
+
+    def _on_arquivo_encontrado_thread(self, info: ArquivoInfo):
+        resultado = ResultadoBusca(telefone=info.telefone, nome=info.nome, caminho=info.caminho)
+        destino_arquivo = os.path.join(self._destino_scan, info.nome)
+        try:
+            os.makedirs(self._destino_scan, exist_ok=True)
+            if not os.path.exists(destino_arquivo):
+                shutil.copy2(info.caminho, destino_arquivo)
+            resultado.copiado = True
+        except Exception as e:
+            resultado.erro = str(e)
+            log.warning("Falha ao copiar %s: %s", info.nome, e)
+            self.root.after(0, lambda l=f"  ✘  ERRO: {info.nome} — {e}": self._append_lista(l))
+
+        self._resultados_scan.append(resultado)
+        icone = "✔" if resultado.copiado else "✘"
+        linha = f"  {icone}  [{info.telefone}]  {info.nome}"
+        self.root.after(0, lambda l=linha: self._append_lista(l))
+
+    def _append_lista(self, linha: str):
+        if self.lista.size() < MAX_LINHAS_UI:
+            self.lista.insert(tk.END, linha)
+            self.lista.yview_moveto(1.0)
+
+    def _finalizar_scan_direcionado(self):
+        self._cancelar_timer_ui()
+        self._set_ui_inativa()
+        s        = self._stats_idx
+        elapsed  = max(time.monotonic() - self._ts_inicio, 0.01)
+        copiados = sum(1 for r in self._resultados_scan if r.copiado)
+        erros    = sum(1 for r in self._resultados_scan if r.erro)
+        vel      = int(s.total_arquivos / elapsed)
+
+        self.lbl_fase.config(text=f"Varredura concluída em {elapsed:.1f}s.", foreground="green")
+        self.lbl_contadores.config(
+            text=(f"Varridos: {s.total_arquivos:,}   Encontrados: {s.novos:,}   "
+                  f"Copiados: {copiados:,}   Erros: {erros:,}   Vel: {vel:,}/s"))
+        self.lista.insert(tk.END, "─"*80, "  CONCLUÍDO",
+            f"  Varridos: {s.total_arquivos:,}   Encontrados: {s.novos:,}",
+            f"  Copiados: {copiados:,}   Erros: {erros:,}   Vel: {vel:,}/s",
+            f"  Tempo: {elapsed:.1f}s")
+        self._verificar_banco()
+
+        msg = (f"Varredura concluída!\n\nVarridos: {s.total_arquivos:,}\n"
+               f"Encontrados: {s.novos:,}\nCopiados: {copiados:,}\nErros: {erros:,}\n"
+               f"Velocidade: {vel:,} arq/s\nTempo: {elapsed:.1f}s")
+        if erros:
+            msg += f"\n\n⚠ {erros} erro(s) de cópia — veja a lista."
+        messagebox.showinfo("Varredura direcionada", msg)
+
+        if copiados > 0 and os.path.isdir(self._destino_scan):
+            try:
+                subprocess.Popen(["explorer", os.path.normpath(self._destino_scan)])
+            except Exception:
+                pass
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # TIMER UI
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _agendar_ui(self):
+        self._after_id = self.root.after(UI_INTERVALO_MS, self._atualizar_ui)
+
+    def _atualizar_ui(self):
+        elapsed = max(time.monotonic() - self._ts_inicio, 0.01)
+        modo    = self._modo_ativo
+
+        if modo == "indexando":
+            s   = self._stats_idx
+            vel = int(s.total_arquivos / elapsed)
+            self.lbl_fase.config(text=f"Indexando: {s.fase}", foreground="blue")
+            if s.pasta_atual:
+                p = s.pasta_atual
+                self.lbl_pasta.config(text=("…" + p[-90:]) if len(p) > 93 else p)
+            total_dirs  = s.dirs_varridos + s.dirs_pulados
+            pct_pulados = (s.dirs_pulados / total_dirs * 100) if total_dirs > 0 else 0
+            self.lbl_contadores.config(text=(
+                f"Dirs pulados: {s.dirs_pulados:,} ({pct_pulados:.0f}%)   "
+                f"Dirs varridos: {s.dirs_varridos:,}   "
+                f"Arq: {s.total_arquivos:,}   Novos: {s.novos:,}   "
+                f"Vel: {vel:,}/s   Tempo: {elapsed:.0f}s"))
+
+        elif modo == "buscando":
+            s = self._stats_bus
+            self.lbl_fase.config(text=f"Busca: {s.fase}", foreground="blue")
+            self.lbl_contadores.config(text=(
+                f"Buscados: {s.total_numeros:,}   Encontrados: {s.encontrados:,}   "
+                f"Copiados: {s.copiados:,}   Tempo: {elapsed:.1f}s"))
+
+        elif modo == "limpando":
+            s = self._stats_limp
+            self.lbl_fase.config(text=f"Limpeza: {s.fase}", foreground="darkorange")
+            self.lbl_contadores.config(text=(
+                f"Verificados: {s.total_verificados:,}   Removidos: {s.removidos:,}   Tempo: {elapsed:.0f}s"))
+
+        elif modo == "scan_direcionado":
+            s   = self._stats_idx
+            vel = int(s.total_arquivos / elapsed)
+            self.lbl_fase.config(text=f"Varrendo: {s.fase}", foreground="darkgreen")
+            if s.pasta_atual:
+                p = s.pasta_atual
+                self.lbl_pasta.config(text=("…" + p[-90:]) if len(p) > 93 else p)
+            self.lbl_contadores.config(text=(
+                f"Varridos: {s.total_arquivos:,}   Encontrados: {s.novos:,}   "
+                f"Vel: {vel:,}/s   Tempo: {elapsed:.0f}s"))
 
         self._agendar_ui()
 
-    # ── Callback de finalização (chamado via root.after pelo worker) ──────────
-
-    def _on_fim(self, achados: list[Achado], erros: list[str]):
-        """
-        O worker chama isso diretamente, mas em thread diferente.
-        Usamos root.after(0, ...) para garantir execução na thread principal.
-        """
-        self.root.after(0, lambda: self._finalizar(achados, erros))
-
-    def _finalizar(self, achados: list[Achado], erros: list[str]):
-        # Cancela timer de UI
+    def _cancelar_timer_ui(self):
         if self._after_id:
             self.root.after_cancel(self._after_id)
             self._after_id = None
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # ESTADO DA UI
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _parar_operacao(self):
+        self._parar.set()
+        self.lbl_fase.config(text="Parando…", foreground="orange")
+        self.btn_parar_idx.config(state="disabled")
+        self.btn_parar_bus.config(state="disabled")
+        self.btn_parar_scan.config(state="disabled")
+
+    def _set_ui_ativa(self, modo: str):
+        for btn in (self.btn_indexar, self.btn_avaliar, self.btn_limpar,
+                    self.btn_buscar, self.btn_scan_direto):
+            btn.config(state="disabled")
+        self.btn_parar_idx.config(state="disabled")
+        self.btn_parar_bus.config(state="disabled")
+        self.btn_parar_scan.config(state="disabled")
+        if modo in ("indexando", "limpando"):
+            self.btn_parar_idx.config(state="normal")
+        elif modo == "buscando":
+            self.btn_parar_bus.config(state="normal")
+        elif modo == "scan_direcionado":
+            self.btn_parar_scan.config(state="normal")
+        self.progressbar.start(12)
+
+    def _set_ui_inativa(self):
+        for btn in (self.btn_indexar, self.btn_avaliar, self.btn_limpar,
+                    self.btn_buscar, self.btn_scan_direto):
+            btn.config(state="normal")
+        self.btn_parar_idx.config(state="disabled")
+        self.btn_parar_bus.config(state="disabled")
+        self.btn_parar_scan.config(state="disabled")
         self.progressbar.stop()
-        self.btn_iniciar.config(state="normal")
-        self.btn_parar.config(state="disabled")
-
-        s = self._stats
-        elapsed = max(time.monotonic() - self._ts_inicio, 0.01)
-
-        self.lbl_fase.config(text="Concluído.", foreground="green")
-        self.lbl_pasta.config(text="Busca encerrada.")
-        self.lbl_contadores.config(
-            text=(
-                f"Analisados: {s['analisados']:,}   "
-                f"Encontrados: {s['encontrados']:,}   "
-                f"Velocidade média: {int(s['analisados']/elapsed):,} arq/s   "
-                f"Tempo total: {elapsed:.1f}s"
-            )
-        )
-
-        # Popula Listbox de uma vez no final (sem overhead durante varredura)
-        linhas = [f"✔  {a.nome}" for a in achados[-MAX_LINHAS_UI:]]
-        if erros:
-            linhas += erros[-200:]
-
-        # insert() em lote — mais previsível que StringVar para listas grandes
-        self.lista.delete(0, tk.END)
-        if linhas:
-            self.lista.insert(tk.END, *linhas)  # *args = uma chamada só
-            self.lista.yview_moveto(1.0)
-
-        # Log final (uma única escrita de I/O para log)
-        log.warning(
-            "RESUMO — Analisados=%d Encontrados=%d Erros=%d Tempo=%.1fs",
-            s["analisados"], s["encontrados"], len(erros), elapsed
-        )
-
-        msg = (
-            f"Busca concluída!\n\n"
-            f"Analisados  : {s['analisados']:,}\n"
-            f"Encontrados : {s['encontrados']:,}\n"
-            f"Erros cópia : {len(erros)}\n"
-            f"Tempo total : {elapsed:.1f}s\n"
-            f"Velocidade  : {int(s['analisados']/elapsed):,} arq/s"
-        )
-        if erros:
-            msg += f"\n\n⚠ {len(erros)} erro(s) — veja a lista."
-        messagebox.showinfo("Concluído", msg)
-
-        destino = self.ent_destino.get().strip()
-        if s["encontrados"] > 0 and os.path.isdir(destino):
-            import subprocess
-            subprocess.Popen(["explorer", os.path.normpath(destino)])
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 # PONTO DE ENTRADA
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     root = tk.Tk()
-    root.minsize(980, 580)
-    w, h = 1020, 640
+    root.minsize(900, 600)
+    w, h = 1020, 720
     sx = (root.winfo_screenwidth()  - w) // 2
     sy = (root.winfo_screenheight() - h) // 2
     root.geometry(f"{w}x{h}+{sx}+{sy}")
-    app = Buscador(root)
+    app = AudioSearcherApp(root)
     root.mainloop()

@@ -39,8 +39,8 @@ BATCH_SIZE = 1_000
 UI_INTERVALO_MS = 1_000
 MAX_LINHAS_UI = 10_000
 
-PASTA_PRINCIPAL_PADRAO = r"\\192.168.101.51\attodigital"
-PASTA_DESTINO_PADRAO   = r"C:\Users\mateus.sousa\Downloads\buscar-ligações\ligações-encontradas"
+PASTA_PRINCIPAL_PADRAO = r"-"
+PASTA_DESTINO_PADRAO   = r"-"
 
 META_ULTIMA_INDEXACAO = "ultima_indexacao"
 META_STATUS_ULTIMA    = "status_ultima_indexacao"
